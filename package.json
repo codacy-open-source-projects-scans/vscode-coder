@@ -4,7 +4,7 @@
   "displayName": "Coder",
   "description": "Open any workspace with a single click.",
   "repository": "https://github.com/coder/vscode-coder",
-  "version": "0.1.36",
+  "version": "0.1.37",
   "engines": {
     "vscode": "^1.73.0"
   },
@@ -251,7 +251,7 @@
     "@typescript-eslint/parser": "^6.21.0",
     "@vscode/test-electron": "^2.3.8",
     "@vscode/vsce": "^2.21.1",
-    "bufferutil": "^4.0.7",
+    "bufferutil": "^4.0.8",
     "coder": "https://github.com/coder/coder#main",
     "dayjs": "^1.11.10",
     "eslint": "^8.50.0",
@@ -274,26 +274,26 @@
   "dependencies": {
     "@types/node-forge": "^1.3.11",
     "@types/ua-parser-js": "^0.7.39",
-    "axios": "1.6.0",
+    "axios": "1.6.8",
     "date-fns": "^2.30.0",
     "eventsource": "^2.0.2",
     "find-process": "^1.4.7",
     "fs-extra": "^11.2.0",
-    "jsonc-parser": "^3.2.0",
+    "jsonc-parser": "^3.2.1",
     "memfs": "^4.7.7",
     "ndjson": "^2.0.0",
     "node-forge": "^1.3.1",
     "pretty-bytes": "^6.0.0",
-    "semver": "^7.5.4",
+    "semver": "^7.6.0",
     "tar-fs": "^2.1.1",
     "ua-parser-js": "^1.0.37",
     "which": "^4.0.0",
-    "ws": "^8.16.0",
-    "yaml": "^2.3.4",
+    "ws": "^8.17.0",
+    "yaml": "^2.4.2",
     "zod": "^3.22.3"
   },
   "resolutions": {
-    "semver": "7.5.4",
+    "semver": "7.6.0",
     "trim": "0.0.3",
     "word-wrap": "1.2.5"
   }
