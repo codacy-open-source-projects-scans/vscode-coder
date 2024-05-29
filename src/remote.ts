@@ -313,8 +313,7 @@ export class Remote {
     // of 15 seconds, which can be too short in the case where we wait for
     // startup scripts.  For now we hardcode a longer value.  Because this is
     // potentially overwriting user configuration, it feels a bit sketchy.  If
-    // microsoft/vscode-remote-release#8519 is resolved we can remove this but
-    // for now to mitigate the sketchiness we will reset it after connecting.
+    // microsoft/vscode-remote-release#8519 is resolved we can remove this.
     const minConnTimeout = 1800
     let mungedConnTimeout = false
     if (!connTimeout || connTimeout < minConnTimeout) {
@@ -334,6 +333,7 @@ export class Remote {
         // write here is not necessarily catastrophic since the user will be
         // asked for the platform and the default timeout might be sufficient.
         mungedPlatforms = mungedConnTimeout = false
+        this.storage.writeToCoderOutputChannel(`Failed to configure settings: ${ex}`)
       }
     }
 
@@ -485,23 +485,6 @@ export class Remote {
     }
 
     this.findSSHProcessID().then((pid) => {
-      // Once the SSH process has spawned we can reset the timeout.
-      if (mungedConnTimeout) {
-        // Re-read settings in case they changed.
-        fs.readFile(this.storage.getUserSettingsPath(), "utf8").then(async (rawSettings) => {
-          try {
-            await fs.writeFile(
-              this.storage.getUserSettingsPath(),
-              jsonc.applyEdits(rawSettings, jsonc.modify(rawSettings, ["remote.SSH.connectTimeout"], connTimeout, {})),
-            )
-          } catch (error) {
-            this.storage.writeToCoderOutputChannel(
-              `Failed to reset remote.SSH.connectTimeout back to ${connTimeout}: ${error}`,
-            )
-          }
-        })
-      }
-
       if (!pid) {
         // TODO: Show an error here!
         return
@@ -606,12 +589,20 @@ export class Remote {
     }
 
     const escape = (str: string): string => `"${str.replace(/"/g, '\\"')}"`
+    // Escape a command line to be executed by the Coder binary, so ssh doesn't substitute variables.
+    const escapeSubcommand: (str: string) => string =
+      os.platform() === "win32"
+        ? // On Windows variables are %VAR%, and we need to use double quotes.
+          (str) => escape(str).replace(/%/g, "%%")
+        : // On *nix we can use single quotes to escape $VARS.
+          // Note single quotes cannot be escaped inside single quotes.
+          (str) => `'${str.replace(/'/g, "'\\''")}'`
 
     // Add headers from the header command.
     let headerArg = ""
     const headerCommand = getHeaderCommand(vscode.workspace.getConfiguration())
     if (typeof headerCommand === "string" && headerCommand.trim().length > 0) {
-      headerArg = ` --header-command ${escape(headerCommand)}`
+      headerArg = ` --header-command ${escapeSubcommand(headerCommand)}`
     }
     let logArg = ""
     if (hasCoderLogs) {
