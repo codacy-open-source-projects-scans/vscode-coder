@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## [v1.0.0](https://github.com/coder/vscode-coder/releases/tag/v1.0.0) (2024-06-05)
+
+### Added
+
+- Support opening workspaces that belong to a different deployment than the one
+  which is currently logged in. This will only work for new connections. If you
+  have an existing connection that errors when connecting because of this,
+  please connect it again using the plugin or the Coder dashboard. Optionally,
+  you may also want to delete your old workspaces from the recents list.
+
+### Fixed
+
+- Escape variables in the header command. If you have a variable in the header
+  command itself, like `echo TEST=$CODER_URL`, it will now work as expected
+  instead of being substituted with a blank or erroneous value.
+
 ## [v0.1.37](https://github.com/coder/vscode-coder/releases/tag/v0.1.37) (2024-05-24)
 
 ### Added
@@ -11,34 +27,34 @@
 - Setting to disable downloading the binary. When disabled, the existing binary
   will be used as-is. If the binary is missing, the plugin will error.
 
-### Fixes
+### Fixed
 
 - Increased timeout will apply to reconnects as well.
 
-### Changes
+### Changed
 
 - Show certificate errors under the token input.
 
 ## [v0.1.36](https://github.com/coder/vscode-coder/releases/tag/v0.1.36) (2024-04-09)
 
-### Changes
+### Changed
 
 - Automatically update a workspace if required by the template.
 - Show more information when remote setup fails.
 
-### Fixes
+### Fixed
 
 - Abort remote connection when remote setup fails.
 
 ## [v0.1.35](https://github.com/coder/vscode-coder/releases/tag/v0.1.35) (2024-03-12)
 
-### Changes
+### Changed
 
 - Support running within Cursor.
 
 ## [v0.1.34](https://github.com/coder/vscode-coder/releases/tag/v0.1.34) (2024-03-03)
 
-### Changes
+### Changed
 
 - Improve fetching the Coder binary. This is mostly just better logging but it
   also will avoid fetching if the existing binary version already matches, to
@@ -46,6 +62,6 @@
 
 ## [v0.1.33](https://github.com/coder/vscode-coder/releases/tag/v0.1.33) (2024-02-20)
 
-### Bug fixes
+### Fixed
 
 - Prevent updating template when automatically starting workspace.
