@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## [v1.1.0](https://github.com/coder/vscode-coder/releases/tag/v1.1.0) (2024-06-17)
+
+### Added
+
+- Workspace and agent statuses now show in the sidebar. These are updated every
+  five seconds.
+- Support http.proxy setting and proxy environment variables.
+
+## [v1.0.2](https://github.com/coder/vscode-coder/releases/tag/v1.0.2) (2024-06-12)
+
+### Fixed
+
+- Redirects will now be followed when watching a workspace build, like when a
+  workspace is automatically started.
+
+## [v1.0.1](https://github.com/coder/vscode-coder/releases/tag/v1.0.1) (2024-06-07)
+
+### Changed
+
+- Improve an error message for when watching a build fails.
+
 ## [v1.0.0](https://github.com/coder/vscode-coder/releases/tag/v1.0.0) (2024-06-05)
 
 ### Added

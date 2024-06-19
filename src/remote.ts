@@ -12,6 +12,7 @@ import * as semver from "semver"
 import * as vscode from "vscode"
 import * as ws from "ws"
 import { makeCoderSdk } from "./api"
+import { errToStr } from "./api-helper"
 import { Commands } from "./commands"
 import { getHeaderCommand } from "./headers"
 import { SSHConfig, SSHValues, mergeSSHConfigValues } from "./sshConfig"
@@ -238,10 +239,12 @@ export class Remote {
         try {
           const baseUrl = new URL(baseUrlRaw)
           const proto = baseUrl.protocol === "https:" ? "wss:" : "ws:"
-          const socket = new ws.WebSocket(new URL(`${proto}//${baseUrl.host}${path}`), {
+          const socketUrlRaw = `${proto}//${baseUrl.host}${path}`
+          const socket = new ws.WebSocket(new URL(socketUrlRaw), {
             headers: {
               "Coder-Session-Token": token,
             },
+            followRedirects: true,
           })
           socket.binaryType = "nodebuffer"
           socket.on("message", (data) => {
@@ -249,15 +252,19 @@ export class Remote {
             const log = JSON.parse(buf.toString()) as ProvisionerJobLog
             writeEmitter.fire(log.output + "\r\n")
           })
-          socket.on("error", (err) => {
-            reject(err)
+          socket.on("error", (error) => {
+            reject(
+              new Error(
+                `Failed to watch workspace build using ${socketUrlRaw}: ${errToStr(error, "no further details")}`,
+              ),
+            )
           })
           socket.on("close", () => {
             resolve()
           })
         } catch (error) {
           // If this errors, it is probably a malformed URL.
-          reject(error)
+          reject(new Error(`Failed to open web socket to ${baseUrlRaw}: ${errToStr(error, "no further details")}`))
         }
       })
       writeEmitter.fire("Build complete")
