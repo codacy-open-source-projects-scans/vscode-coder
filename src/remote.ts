@@ -12,13 +12,14 @@ import * as semver from "semver"
 import * as vscode from "vscode"
 import { makeCoderSdk, startWorkspace, waitForBuild } from "./api"
 import { extractAgents } from "./api-helper"
+import * as cli from "./cliManager"
 import { Commands } from "./commands"
+import { featureSetForVersion, FeatureSet } from "./featureSet"
 import { getHeaderCommand } from "./headers"
 import { SSHConfig, SSHValues, mergeSSHConfigValues } from "./sshConfig"
 import { computeSSHProperties, sshSupportsSetEnv } from "./sshSupport"
 import { Storage } from "./storage"
-import { AuthorityPrefix, parseRemoteAuthority } from "./util"
-import { supportsCoderAgentLogDirFlag } from "./version"
+import { AuthorityPrefix, expandPath, parseRemoteAuthority } from "./util"
 import { WorkspaceAction } from "./workspaceAction"
 
 export interface RemoteDetails extends vscode.Disposable {
@@ -193,16 +194,34 @@ export class Remote {
     // Store for use in commands.
     this.commands.workspaceRestClient = workspaceRestClient
 
+    let binaryPath: string | undefined
+    if (this.mode === vscode.ExtensionMode.Production) {
+      binaryPath = await this.storage.fetchBinary(workspaceRestClient, parts.label)
+    } else {
+      try {
+        // In development, try to use `/tmp/coder` as the binary path.
+        // This is useful for debugging with a custom bin!
+        binaryPath = path.join(os.tmpdir(), "coder")
+        await fs.stat(binaryPath)
+      } catch (ex) {
+        binaryPath = await this.storage.fetchBinary(workspaceRestClient, parts.label)
+      }
+    }
+
     // First thing is to check the version.
     const buildInfo = await workspaceRestClient.getBuildInfo()
-    const parsedVersion = semver.parse(buildInfo.version)
+
+    let version: semver.SemVer | null = null
+    try {
+      version = semver.parse(await cli.version(binaryPath))
+    } catch (e) {
+      version = semver.parse(buildInfo.version)
+    }
+
+    const featureSet = featureSetForVersion(version)
+
     // Server versions before v0.14.1 don't support the vscodessh command!
-    if (
-      parsedVersion?.major === 0 &&
-      parsedVersion?.minor <= 14 &&
-      parsedVersion?.patch < 1 &&
-      parsedVersion?.prerelease.length === 0
-    ) {
+    if (!featureSet.vscodessh) {
       await this.vscodeProposed.window.showErrorMessage(
         "Incompatible Server",
         {
@@ -215,7 +234,6 @@ export class Remote {
       await this.closeRemote()
       return
     }
-    const hasCoderLogs = supportsCoderAgentLogDirFlag(parsedVersion)
 
     // Next is to find the workspace from the URI scheme provided.
     let workspace: Workspace
@@ -501,7 +519,7 @@ export class Remote {
     // "Host not found".
     try {
       this.storage.writeToCoderOutputChannel("Updating SSH config...")
-      await this.updateSSHConfig(workspaceRestClient, parts.label, parts.host, hasCoderLogs)
+      await this.updateSSHConfig(workspaceRestClient, parts.label, parts.host, binaryPath, featureSet)
     } catch (error) {
       this.storage.writeToCoderOutputChannel(`Failed to configure SSH: ${error}`)
       throw error
@@ -541,9 +559,35 @@ export class Remote {
     }
   }
 
+  /**
+   * Format's the --log-dir argument for the ProxyCommand
+   */
+  private async formatLogArg(featureSet: FeatureSet): Promise<string> {
+    if (!featureSet.proxyLogDirectory) {
+      return ""
+    }
+
+    // If the proxyLogDirectory is not set in the extension settings we don't send one.
+    // Question for Asher: How do VSCode extension settings behave in terms of semver for the extension?
+    const logDir = expandPath(String(vscode.workspace.getConfiguration().get("coder.proxyLogDirectory") ?? "").trim())
+    if (!logDir) {
+      return ""
+    }
+
+    await fs.mkdir(logDir, { recursive: true })
+    this.storage.writeToCoderOutputChannel(`SSH proxy diagnostics are being written to ${logDir}`)
+    return ` --log-dir ${escape(logDir)}`
+  }
+
   // updateSSHConfig updates the SSH configuration with a wildcard that handles
   // all Coder entries.
-  private async updateSSHConfig(restClient: Api, label: string, hostName: string, hasCoderLogs = false) {
+  private async updateSSHConfig(
+    restClient: Api,
+    label: string,
+    hostName: string,
+    binaryPath: string,
+    featureSet: FeatureSet,
+  ) {
     let deploymentSSHConfig = {}
     try {
       const deploymentConfig = await restClient.getDeploymentSSHConfig()
@@ -604,20 +648,6 @@ export class Remote {
     const sshConfig = new SSHConfig(sshConfigFile)
     await sshConfig.load()
 
-    let binaryPath: string | undefined
-    if (this.mode === vscode.ExtensionMode.Production) {
-      binaryPath = await this.storage.fetchBinary(restClient, label)
-    } else {
-      try {
-        // In development, try to use `/tmp/coder` as the binary path.
-        // This is useful for debugging with a custom bin!
-        binaryPath = path.join(os.tmpdir(), "coder")
-        await fs.stat(binaryPath)
-      } catch (ex) {
-        binaryPath = await this.storage.fetchBinary(restClient, label)
-      }
-    }
-
     const escape = (str: string): string => `"${str.replace(/"/g, '\\"')}"`
     // Escape a command line to be executed by the Coder binary, so ssh doesn't substitute variables.
     const escapeSubcommand: (str: string) => string =
@@ -634,16 +664,12 @@ export class Remote {
     if (typeof headerCommand === "string" && headerCommand.trim().length > 0) {
       headerArg = ` --header-command ${escapeSubcommand(headerCommand)}`
     }
-    let logArg = ""
-    if (hasCoderLogs) {
-      await fs.mkdir(this.storage.getLogPath(), { recursive: true })
-      logArg = ` --log-dir ${escape(this.storage.getLogPath())}`
-    }
+
     const sshValues: SSHValues = {
       Host: label ? `${AuthorityPrefix}.${label}--*` : `${AuthorityPrefix}--*`,
       ProxyCommand: `${escape(binaryPath)}${headerArg} vscodessh --network-info-dir ${escape(
         this.storage.getNetworkInfoPath(),
-      )}${logArg} --session-token-file ${escape(this.storage.getSessionTokenPath(label))} --url-file ${escape(
+      )}${await this.formatLogArg(featureSet)} --session-token-file ${escape(this.storage.getSessionTokenPath(label))} --url-file ${escape(
         this.storage.getUrlPath(label),
       )} %h`,
       ConnectTimeout: "0",
