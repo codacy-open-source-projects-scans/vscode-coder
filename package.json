@@ -192,6 +192,12 @@
       }
     ],
     "menus": {
+      "commandPalette": [
+          {
+              "command": "coder.openFromSidebar",
+              "when": "false"
+          }
+      ],
       "view/title": [
         {
           "command": "coder.logout",
@@ -260,15 +266,15 @@
     "@types/node-forge": "^1.3.11",
     "@types/ua-parser-js": "^0.7.39",
     "@types/vscode": "^1.73.0",
-    "@types/ws": "^8.5.10",
+    "@types/ws": "^8.5.11",
     "@typescript-eslint/eslint-plugin": "^6.21.0",
     "@typescript-eslint/parser": "^6.21.0",
     "@vscode/test-electron": "^2.4.0",
     "@vscode/vsce": "^2.21.1",
     "bufferutil": "^4.0.8",
     "coder": "https://github.com/coder/coder#main",
-    "dayjs": "^1.11.10",
-    "eslint": "^8.50.0",
+    "dayjs": "^1.11.13",
+    "eslint": "^8.57.1",
     "eslint-config-prettier": "^9.1.0",
     "eslint-plugin-import": "^2.29.1",
     "eslint-plugin-md": "^1.0.19",
@@ -282,11 +288,11 @@
     "utf-8-validate": "^6.0.4",
     "vitest": "^0.34.6",
     "vscode-test": "^1.5.0",
-    "webpack": "^5.92.0",
+    "webpack": "^5.94.0",
     "webpack-cli": "^5.1.4"
   },
   "dependencies": {
-    "axios": "1.6.8",
+    "axios": "1.7.7",
     "date-fns": "^3.6.0",
     "eventsource": "^2.0.2",
     "find-process": "^1.4.7",
@@ -297,7 +303,7 @@
     "proxy-agent": "^6.4.0",
     "semver": "^7.6.2",
     "ua-parser-js": "^1.0.38",
-    "ws": "^8.17.1",
+    "ws": "^8.18.0",
     "zod": "^3.23.8"
   },
   "resolutions": {
