@@ -10,6 +10,7 @@ import {
   extractAgents,
   errToStr,
 } from "./api-helper"
+import { Storage } from "./storage"
 
 export enum WorkspaceQuery {
   Mine = "owner:me",
@@ -32,14 +33,17 @@ type AgentWatcher = {
  * abort polling until fetchAndRefresh() is called again.
  */
 export class WorkspaceProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
-  private workspaces: WorkspaceTreeItem[] = []
+  // Undefined if we have never fetched workspaces before.
+  private workspaces: WorkspaceTreeItem[] | undefined
   private agentWatchers: Record<WorkspaceAgent["id"], AgentWatcher> = {}
   private timeout: NodeJS.Timeout | undefined
   private fetching = false
+  private visible = false
 
   constructor(
     private readonly getWorkspacesQuery: WorkspaceQuery,
     private readonly restClient: Api,
+    private readonly storage: Storage,
     private readonly timerSeconds?: number,
   ) {
     // No initialization.
@@ -48,10 +52,10 @@ export class WorkspaceProvider implements vscode.TreeDataProvider<vscode.TreeIte
   // fetchAndRefresh fetches new workspaces, re-renders the entire tree, then
   // keeps refreshing (if a timer length was provided) as long as the user is
   // still logged in and no errors were encountered fetching workspaces.
-  // Calling this while already refreshing is a no-op and will return
-  // immediately.
+  // Calling this while already refreshing or not visible is a no-op and will
+  // return immediately.
   async fetchAndRefresh() {
-    if (this.fetching) {
+    if (this.fetching || !this.visible) {
       return
     }
     this.fetching = true
@@ -83,7 +87,11 @@ export class WorkspaceProvider implements vscode.TreeDataProvider<vscode.TreeIte
    * Fetch workspaces and turn them into tree items.  Throw an error if not
    * logged in or the query fails.
    */
-  async fetch(): Promise<WorkspaceTreeItem[]> {
+  private async fetch(): Promise<WorkspaceTreeItem[]> {
+    if (vscode.env.logLevel <= vscode.LogLevel.Debug) {
+      this.storage.writeToCoderOutputChannel(`Fetching workspaces: ${this.getWorkspacesQuery || "no filter"}...`)
+    }
+
     // If there is no URL configured, assume we are logged out.
     const restClient = this.restClient
     const url = restClient.getAxiosInstance().defaults.baseURL
@@ -144,10 +152,15 @@ export class WorkspaceProvider implements vscode.TreeDataProvider<vscode.TreeIte
 
   /**
    * Either start or stop the refresh timer based on visibility.
+   *
+   * If we have never fetched workspaces and are visible, fetch immediately.
    */
   setVisibility(visible: boolean) {
+    this.visible = visible
     if (!visible) {
       this.cancelPendingRefresh()
+    } else if (!this.workspaces) {
+      this.fetchAndRefresh()
     } else {
       this.maybeScheduleRefresh()
     }
@@ -205,7 +218,7 @@ export class WorkspaceProvider implements vscode.TreeDataProvider<vscode.TreeIte
 
       return Promise.resolve([])
     }
-    return Promise.resolve(this.workspaces)
+    return Promise.resolve(this.workspaces || [])
   }
 }
 

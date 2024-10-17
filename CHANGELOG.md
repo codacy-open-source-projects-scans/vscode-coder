@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+## [v1.3.5](https://github.com/coder/vscode-coder/releases/tag/v1.3.5) (2024-10-16)
+
+### Fixed
+
+- Error messages from the workspace watch endpoint were not logged correctly.
+- Delay notifying about workspaces shutting down since the connection might bump
+  the activity, making the notification misleading.
+
+## [v1.3.4](https://github.com/coder/vscode-coder/releases/tag/v1.3.4) (2024-10-14)
+
+### Fixed
+
+- The "All Workspaces" view was not being populated due to visibility check.
+
+### Added
+
+- Log workspaces queries when running with `--log=debug`.
+- Coder output logs will now have the date prefixed to each line.
+
+## [v1.3.3](https://github.com/coder/vscode-coder/releases/tag/v1.3.3) (2024-10-14)
+
+### Fixed
+
+- The plugin no longer immediately starts polling workspaces when connecting to
+  a remote. It will only do this when the Coder sidebar is open.
+
+### Changed
+
+- Instead of monitoring all workspaces for impending autostops and deletions,
+  the plugin now only monitors the connected workspace.
+
 ## [v1.3.2](https://github.com/coder/vscode-coder/releases/tag/v1.3.2) (2024-09-10)
 
 ### Fixed
