@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+## [v1.3.9](https://github.com/coder/vscode-coder/releases/tag/v1.3.9) (2024-12-12)
+
+- Only show a login failure dialog for explicit logins (and not autologins).
+
+## [v1.3.8](https://github.com/coder/vscode-coder/releases/tag/v1.3.8) (2024-12-06)
+
+- When starting a workspace, shell out to the Coder binary instead of making an
+  API call. This reduces drift between what the plugin does and the CLI does. As
+  part of this, the `session_token` file was renamed to `session` since that is
+  what the CLI expects.
+
+## [v1.3.7](https://github.com/coder/vscode-coder/releases/tag/v1.3.7) (2024-11-04)
+
+### Added
+
+- New setting `coder.tlsAltHost` to configure an alternative hostname to use for
+  TLS verification. This is useful when the hostname in the certificate does not
+  match the hostname used to connect.
+
+## [v1.3.6](https://github.com/coder/vscode-coder/releases/tag/v1.3.6) (2024-11-04)
+
+### Added
+
+- Default URL setting that takes precedence over CODER_URL.
+- Autologin setting that automatically initiates login when the extension
+  activates using either the default URL or CODER_URL.
+
+### Changed
+
+- When a client certificate and/or key is configured, skip token authentication.
+
 ## [v1.3.5](https://github.com/coder/vscode-coder/releases/tag/v1.3.5) (2024-10-16)
 
 ### Fixed

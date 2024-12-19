@@ -9,7 +9,7 @@ import * as path from "path"
 import prettyBytes from "pretty-bytes"
 import * as semver from "semver"
 import * as vscode from "vscode"
-import { makeCoderSdk, startWorkspaceIfStoppedOrFailed, waitForBuild } from "./api"
+import { makeCoderSdk, needToken, startWorkspaceIfStoppedOrFailed, waitForBuild } from "./api"
 import { extractAgents } from "./api-helper"
 import * as cli from "./cliManager"
 import { Commands } from "./commands"
@@ -50,7 +50,12 @@ export class Remote {
   /**
    * Try to get the workspace running.  Return undefined if the user canceled.
    */
-  private async maybeWaitForRunning(restClient: Api, workspace: Workspace): Promise<Workspace | undefined> {
+  private async maybeWaitForRunning(
+    restClient: Api,
+    workspace: Workspace,
+    label: string,
+    binPath: string,
+  ): Promise<Workspace | undefined> {
     // Maybe already running?
     if (workspace.latest_build.status === "running") {
       return workspace
@@ -63,6 +68,28 @@ export class Remote {
     let terminal: undefined | vscode.Terminal
     let attempts = 0
 
+    function initWriteEmitterAndTerminal(): vscode.EventEmitter<string> {
+      if (!writeEmitter) {
+        writeEmitter = new vscode.EventEmitter<string>()
+      }
+      if (!terminal) {
+        terminal = vscode.window.createTerminal({
+          name: "Build Log",
+          location: vscode.TerminalLocation.Panel,
+          // Spin makes this gear icon spin!
+          iconPath: new vscode.ThemeIcon("gear~spin"),
+          pty: {
+            onDidWrite: writeEmitter.event,
+            close: () => undefined,
+            open: () => undefined,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          } as Partial<vscode.Pseudoterminal> as any,
+        })
+        terminal.show(true)
+      }
+      return writeEmitter
+    }
+
     try {
       // Show a notification while we wait.
       return await this.vscodeProposed.window.withProgress(
@@ -72,30 +99,14 @@ export class Remote {
           title: "Waiting for workspace build...",
         },
         async () => {
+          const globalConfigDir = path.dirname(this.storage.getSessionTokenPath(label))
           while (workspace.latest_build.status !== "running") {
             ++attempts
             switch (workspace.latest_build.status) {
               case "pending":
               case "starting":
               case "stopping":
-                if (!writeEmitter) {
-                  writeEmitter = new vscode.EventEmitter<string>()
-                }
-                if (!terminal) {
-                  terminal = vscode.window.createTerminal({
-                    name: "Build Log",
-                    location: vscode.TerminalLocation.Panel,
-                    // Spin makes this gear icon spin!
-                    iconPath: new vscode.ThemeIcon("gear~spin"),
-                    pty: {
-                      onDidWrite: writeEmitter.event,
-                      close: () => undefined,
-                      open: () => undefined,
-                      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                    } as Partial<vscode.Pseudoterminal> as any,
-                  })
-                  terminal.show(true)
-                }
+                writeEmitter = initWriteEmitterAndTerminal()
                 this.storage.writeToCoderOutputChannel(`Waiting for ${workspaceName}...`)
                 workspace = await waitForBuild(restClient, writeEmitter, workspace)
                 break
@@ -103,8 +114,15 @@ export class Remote {
                 if (!(await this.confirmStart(workspaceName))) {
                   return undefined
                 }
+                writeEmitter = initWriteEmitterAndTerminal()
                 this.storage.writeToCoderOutputChannel(`Starting ${workspaceName}...`)
-                workspace = await startWorkspaceIfStoppedOrFailed(restClient, workspace)
+                workspace = await startWorkspaceIfStoppedOrFailed(
+                  restClient,
+                  globalConfigDir,
+                  binPath,
+                  workspace,
+                  writeEmitter,
+                )
                 break
               case "failed":
                 // On a first attempt, we will try starting a failed workspace
@@ -113,8 +131,15 @@ export class Remote {
                   if (!(await this.confirmStart(workspaceName))) {
                     return undefined
                   }
+                  writeEmitter = initWriteEmitterAndTerminal()
                   this.storage.writeToCoderOutputChannel(`Starting ${workspaceName}...`)
-                  workspace = await startWorkspaceIfStoppedOrFailed(restClient, workspace)
+                  workspace = await startWorkspaceIfStoppedOrFailed(
+                    restClient,
+                    globalConfigDir,
+                    binPath,
+                    workspace,
+                    writeEmitter,
+                  )
                   break
                 }
               // Otherwise fall through and error.
@@ -156,11 +181,14 @@ export class Remote {
 
     const workspaceName = `${parts.username}/${parts.workspace}`
 
+    // Migrate "session_token" file to "session", if needed.
+    await this.storage.migrateSessionToken(parts.label)
+
     // Get the URL and token belonging to this host.
     const { url: baseUrlRaw, token } = await this.storage.readCliConfig(parts.label)
 
     // It could be that the cli config was deleted.  If so, ask for the url.
-    if (!baseUrlRaw || !token) {
+    if (!baseUrlRaw || (!token && needToken())) {
       const result = await this.vscodeProposed.window.showInformationMessage(
         "You are not logged in...",
         {
@@ -292,7 +320,7 @@ export class Remote {
     disposables.push(this.registerLabelFormatter(remoteAuthority, workspace.owner_name, workspace.name))
 
     // If the workspace is not in a running state, try to get it running.
-    const updatedWorkspace = await this.maybeWaitForRunning(workspaceRestClient, workspace)
+    const updatedWorkspace = await this.maybeWaitForRunning(workspaceRestClient, workspace, parts.label, binaryPath)
     if (!updatedWorkspace) {
       // User declined to start the workspace.
       await this.closeRemote()
@@ -430,6 +458,8 @@ export class Remote {
       return
     }
 
+    const logDir = this.getLogDir(featureSet)
+
     // This ensures the Remote SSH extension resolves the host to execute the
     // Coder binary properly.
     //
@@ -437,7 +467,7 @@ export class Remote {
     // "Host not found".
     try {
       this.storage.writeToCoderOutputChannel("Updating SSH config...")
-      await this.updateSSHConfig(workspaceRestClient, parts.label, parts.host, binaryPath, featureSet)
+      await this.updateSSHConfig(workspaceRestClient, parts.label, parts.host, binaryPath, logDir)
     } catch (error) {
       this.storage.writeToCoderOutputChannel(`Failed to configure SSH: ${error}`)
       throw error
@@ -450,7 +480,7 @@ export class Remote {
         return
       }
       disposables.push(this.showNetworkUpdates(pid))
-      this.commands.workspaceLogPath = path.join(this.storage.getLogPath(), `${pid}.log`)
+      this.commands.workspaceLogPath = logDir ? path.join(logDir, `${pid}.log`) : undefined
     })
 
     // Register the label formatter again because SSH overrides it!
@@ -476,20 +506,25 @@ export class Remote {
   }
 
   /**
-   * Format's the --log-dir argument for the ProxyCommand
+   * Return the --log-dir argument value for the ProxyCommand.  It may be an
+   * empty string if the setting is not set or the cli does not support it.
    */
-  private async formatLogArg(featureSet: FeatureSet): Promise<string> {
+  private getLogDir(featureSet: FeatureSet): string {
     if (!featureSet.proxyLogDirectory) {
       return ""
     }
-
     // If the proxyLogDirectory is not set in the extension settings we don't send one.
-    // Question for Asher: How do VSCode extension settings behave in terms of semver for the extension?
-    const logDir = expandPath(String(vscode.workspace.getConfiguration().get("coder.proxyLogDirectory") ?? "").trim())
+    return expandPath(String(vscode.workspace.getConfiguration().get("coder.proxyLogDirectory") ?? "").trim())
+  }
+
+  /**
+   * Formats the --log-dir argument for the ProxyCommand after making sure it
+   * has been created.
+   */
+  private async formatLogArg(logDir: string): Promise<string> {
     if (!logDir) {
       return ""
     }
-
     await fs.mkdir(logDir, { recursive: true })
     this.storage.writeToCoderOutputChannel(`SSH proxy diagnostics are being written to ${logDir}`)
     return ` --log-dir ${escape(logDir)}`
@@ -497,13 +532,7 @@ export class Remote {
 
   // updateSSHConfig updates the SSH configuration with a wildcard that handles
   // all Coder entries.
-  private async updateSSHConfig(
-    restClient: Api,
-    label: string,
-    hostName: string,
-    binaryPath: string,
-    featureSet: FeatureSet,
-  ) {
+  private async updateSSHConfig(restClient: Api, label: string, hostName: string, binaryPath: string, logDir: string) {
     let deploymentSSHConfig = {}
     try {
       const deploymentConfig = await restClient.getDeploymentSSHConfig()
@@ -585,7 +614,7 @@ export class Remote {
       Host: label ? `${AuthorityPrefix}.${label}--*` : `${AuthorityPrefix}--*`,
       ProxyCommand: `${escape(binaryPath)}${headerArg} vscodessh --network-info-dir ${escape(
         this.storage.getNetworkInfoPath(),
-      )}${await this.formatLogArg(featureSet)} --session-token-file ${escape(this.storage.getSessionTokenPath(label))} --url-file ${escape(
+      )}${await this.formatLogArg(logDir)} --session-token-file ${escape(this.storage.getSessionTokenPath(label))} --url-file ${escape(
         this.storage.getUrlPath(label),
       )} %h`,
       ConnectTimeout: "0",

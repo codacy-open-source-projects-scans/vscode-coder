@@ -4,7 +4,7 @@
   "displayName": "Coder",
   "description": "Open any workspace with a single click.",
   "repository": "https://github.com/coder/vscode-coder",
-  "version": "1.3.5",
+  "version": "1.3.9",
   "engines": {
     "vscode": "^1.73.0"
   },
@@ -74,17 +74,22 @@
           "default": ""
         },
         "coder.tlsCertFile": {
-          "markdownDescription": "Path to file for TLS client cert",
+          "markdownDescription": "Path to file for TLS client cert. When specified, token authorization will be skipped. `http.proxySupport` must be set to `on` or `off`, otherwise VS Code will override the proxy agent set by the plugin.",
           "type": "string",
           "default": ""
         },
         "coder.tlsKeyFile": {
-          "markdownDescription": "Path to file for TLS client key",
+          "markdownDescription": "Path to file for TLS client key. When specified, token authorization will be skipped. `http.proxySupport` must be set to `on` or `off`, otherwise VS Code will override the proxy agent set by the plugin.",
           "type": "string",
           "default": ""
         },
         "coder.tlsCaFile": {
-          "markdownDescription": "Path to file for TLS certificate authority",
+          "markdownDescription": "Path to file for TLS certificate authority. `http.proxySupport` must be set to `on` or `off`, otherwise VS Code will override the proxy agent set by the plugin.",
+          "type": "string",
+          "default": ""
+        },
+        "coder.tlsAltHost": {
+          "markdownDescription": "Alternative hostname to use for TLS verification. This is useful when the hostname in the certificate does not match the hostname used to connect.",
           "type": "string",
           "default": ""
         },
@@ -97,6 +102,16 @@
           "markdownDescription": "If not set, will inherit from the `no_proxy` or `NO_PROXY` environment variables. `http.proxySupport` must be set to `on` or `off`, otherwise VS Code will override the proxy agent set by the plugin.",
           "type": "string",
           "default": ""
+        },
+        "coder.defaultUrl": {
+          "markdownDescription": "This will be shown in the URL prompt, along with the CODER_URL environment variable if set, for the user to select when logging in.",
+          "type": "string",
+          "default": ""
+        },
+        "coder.autologin": {
+          "markdownDescription": "Automatically log into the default URL when the extension is activated. coder.defaultUrl is preferred, otherwise the CODER_URL environment variable will be used. This setting has no effect if neither is set.",
+          "type": "boolean",
+          "default": false
         }
       }
     },
@@ -276,11 +291,11 @@
     "dayjs": "^1.11.13",
     "eslint": "^8.57.1",
     "eslint-config-prettier": "^9.1.0",
-    "eslint-plugin-import": "^2.30.0",
+    "eslint-plugin-import": "^2.31.0",
     "eslint-plugin-md": "^1.0.19",
     "eslint-plugin-prettier": "^5.2.1",
     "glob": "^10.4.2",
-    "nyc": "^15.1.0",
+    "nyc": "^17.1.0",
     "prettier": "^3.3.3",
     "ts-loader": "^9.5.1",
     "tsc-watch": "^6.2.0",

@@ -2,7 +2,7 @@ import { Api } from "coder/site/src/api/api"
 import { getErrorMessage } from "coder/site/src/api/errors"
 import { User, Workspace, WorkspaceAgent } from "coder/site/src/api/typesGenerated"
 import * as vscode from "vscode"
-import { makeCoderSdk } from "./api"
+import { makeCoderSdk, needToken } from "./api"
 import { extractAgents } from "./api-helper"
 import { CertificateError } from "./error"
 import { Storage } from "./storage"
@@ -78,13 +78,14 @@ export class Commands {
    * CODER_URL or enter a new one.  Undefined means the user aborted.
    */
   private async askURL(selection?: string): Promise<string | undefined> {
+    const defaultURL = vscode.workspace.getConfiguration().get<string>("coder.defaultUrl") ?? ""
     const quickPick = vscode.window.createQuickPick()
-    quickPick.value = selection || process.env.CODER_URL || ""
+    quickPick.value = selection || defaultURL || process.env.CODER_URL || ""
     quickPick.placeholder = "https://example.coder.com"
     quickPick.title = "Enter the URL of your Coder deployment."
 
     // Initial items.
-    quickPick.items = this.storage.withUrlHistory(process.env.CODER_URL).map((url) => ({
+    quickPick.items = this.storage.withUrlHistory(defaultURL, process.env.CODER_URL).map((url) => ({
       alwaysShow: true,
       label: url,
     }))
@@ -93,7 +94,7 @@ export class Commands {
     // an option in case the user wants to connect to something that is not in
     // the list.
     quickPick.onDidChangeValue((value) => {
-      quickPick.items = this.storage.withUrlHistory(process.env.CODER_URL, value).map((url) => ({
+      quickPick.items = this.storage.withUrlHistory(defaultURL, process.env.CODER_URL, value).map((url) => ({
         alwaysShow: true,
         label: url,
       }))
@@ -111,8 +112,8 @@ export class Commands {
 
   /**
    * Ask the user for the URL if it was not provided, letting them choose from a
-   * list of recent URLs or CODER_URL or enter a new one, and normalizes the
-   * returned URL.  Undefined means the user aborted.
+   * list of recent URLs or the default URL or CODER_URL or enter a new one, and
+   * normalizes the returned URL.  Undefined means the user aborted.
    */
   public async maybeAskUrl(providedUrl: string | undefined | null, lastUsedUrl?: string): Promise<string | undefined> {
     let url = providedUrl || (await this.askURL(lastUsedUrl))
@@ -134,91 +135,53 @@ export class Commands {
 
   /**
    * Log into the provided deployment.  If the deployment URL is not specified,
-   * ask for it first with a menu showing recent URLs and CODER_URL, if set.
+   * ask for it first with a menu showing recent URLs along with the default URL
+   * and CODER_URL, if those are set.
    */
   public async login(...args: string[]): Promise<void> {
-    const url = await this.maybeAskUrl(args[0])
+    // Destructure would be nice but VS Code can pass undefined which errors.
+    const inputUrl = args[0]
+    const inputToken = args[1]
+    const inputLabel = args[2]
+    const isAutologin = typeof args[3] === "undefined" ? false : Boolean(args[3])
+
+    const url = await this.maybeAskUrl(inputUrl)
     if (!url) {
-      return
+      return // The user aborted.
     }
 
     // It is possible that we are trying to log into an old-style host, in which
     // case we want to write with the provided blank label instead of generating
     // a host label.
-    const label = typeof args[2] === "undefined" ? toSafeHost(url) : args[2]
+    const label = typeof inputLabel === "undefined" ? toSafeHost(url) : inputLabel
 
-    // Use a temporary client to avoid messing with the global one while trying
-    // to log in.
-    const restClient = await makeCoderSdk(url, undefined, this.storage)
-
-    let user: User | undefined
-    let token: string | undefined = args[1]
-    if (!token) {
-      const opened = await vscode.env.openExternal(vscode.Uri.parse(`${url}/cli-auth`))
-      if (!opened) {
-        vscode.window.showWarningMessage("You must accept the URL prompt to generate an API key.")
-        return
-      }
-
-      token = await vscode.window.showInputBox({
-        title: "Coder API Key",
-        password: true,
-        placeHolder: "Copy your API key from the opened browser page.",
-        value: await this.storage.getSessionToken(),
-        ignoreFocusOut: true,
-        validateInput: async (value) => {
-          restClient.setSessionToken(value)
-          try {
-            user = await restClient.getAuthenticatedUser()
-            if (!user) {
-              throw new Error("Failed to get authenticated user")
-            }
-          } catch (err) {
-            // For certificate errors show both a notification and add to the
-            // text under the input box, since users sometimes miss the
-            // notification.
-            if (err instanceof CertificateError) {
-              err.showNotification()
-
-              return {
-                message: err.x509Err || err.message,
-                severity: vscode.InputBoxValidationSeverity.Error,
-              }
-            }
-            // This could be something like the header command erroring or an
-            // invalid session token.
-            const message = getErrorMessage(err, "no response from the server")
-            return {
-              message: "Failed to authenticate: " + message,
-              severity: vscode.InputBoxValidationSeverity.Error,
-            }
-          }
-        },
-      })
-    }
-    if (!token || !user) {
-      return
+    // Try to get a token from the user, if we need one, and their user.
+    const res = await this.maybeAskToken(url, inputToken, isAutologin)
+    if (!res) {
+      return // The user aborted, or unable to auth.
     }
 
-    // The URL and token are good; authenticate the global client.
+    // The URL is good and the token is either good or not required; authorize
+    // the global client.
     this.restClient.setHost(url)
-    this.restClient.setSessionToken(token)
+    this.restClient.setSessionToken(res.token)
 
     // Store these to be used in later sessions.
     await this.storage.setUrl(url)
-    await this.storage.setSessionToken(token)
+    await this.storage.setSessionToken(res.token)
 
     // Store on disk to be used by the cli.
-    await this.storage.configureCli(label, url, token)
+    await this.storage.configureCli(label, url, res.token)
 
+    // These contexts control various menu items and the sidebar.
     await vscode.commands.executeCommand("setContext", "coder.authenticated", true)
-    if (user.roles.find((role) => role.name === "owner")) {
+    if (res.user.roles.find((role) => role.name === "owner")) {
       await vscode.commands.executeCommand("setContext", "coder.isOwner", true)
     }
 
     vscode.window
       .showInformationMessage(
-        `Welcome to Coder, ${user.username}!`,
+        `Welcome to Coder, ${res.user.username}!`,
         {
           detail: "You can now use the Coder extension to manage your Coder instance.",
         },
@@ -235,11 +198,97 @@ export class Commands {
   }
 
   /**
+   * If necessary, ask for a token, and keep asking until the token has been
+   * validated.  Return the token and user that was fetched to validate the
+   * token.  Null means the user aborted or we were unable to authenticate with
+   * mTLS (in the latter case, an error notification will have been displayed).
+   */
+  private async maybeAskToken(
+    url: string,
+    token: string,
+    isAutologin: boolean,
+  ): Promise<{ user: User; token: string } | null> {
+    const restClient = await makeCoderSdk(url, token, this.storage)
+    if (!needToken()) {
+      try {
+        const user = await restClient.getAuthenticatedUser()
+        // For non-token auth, we write a blank token since the `vscodessh`
+        // command currently always requires a token file.
+        return { token: "", user }
+      } catch (err) {
+        const message = getErrorMessage(err, "no response from the server")
+        if (isAutologin) {
+          this.storage.writeToCoderOutputChannel(`Failed to log in to Coder server: ${message}`)
+        } else {
+          this.vscodeProposed.window.showErrorMessage("Failed to log in to Coder server", {
+            detail: message,
+            modal: true,
+            useCustom: true,
+          })
+        }
+        // Invalid certificate, most likely.
+        return null
+      }
+    }
+
+    // This prompt is for convenience; do not error if they close it since
+    // they may already have a token or already have the page opened.
+    await vscode.env.openExternal(vscode.Uri.parse(`${url}/cli-auth`))
+
+    // For token auth, start with the existing token in the prompt or the last
+    // used token.  Once submitted, if there is a failure we will keep asking
+    // the user for a new token until they quit.
+    let user: User | undefined
+    const validatedToken = await vscode.window.showInputBox({
+      title: "Coder API Key",
+      password: true,
+      placeHolder: "Paste your API key.",
+      value: token || (await this.storage.getSessionToken()),
+      ignoreFocusOut: true,
+      validateInput: async (value) => {
+        restClient.setSessionToken(value)
+        try {
+          user = await restClient.getAuthenticatedUser()
+        } catch (err) {
+          // For certificate errors show both a notification and add to the
+          // text under the input box, since users sometimes miss the
+          // notification.
+          if (err instanceof CertificateError) {
+            err.showNotification()
+
+            return {
+              message: err.x509Err || err.message,
+              severity: vscode.InputBoxValidationSeverity.Error,
+            }
+          }
+          // This could be something like the header command erroring or an
+          // invalid session token.
+          const message = getErrorMessage(err, "no response from the server")
+          return {
+            message: "Failed to authenticate: " + message,
+            severity: vscode.InputBoxValidationSeverity.Error,
+          }
+        }
+      },
+    })
+
+    if (validatedToken && user) {
+      return { token: validatedToken, user }
+    }
+
+    // User aborted.
+    return null
+  }
+
+  /**
    * View the logs for the currently connected workspace.
    */
   public async viewLogs(): Promise<void> {
     if (!this.workspaceLogPath) {
-      vscode.window.showInformationMessage("No logs available.", this.workspaceLogPath || "<unset>")
+      vscode.window.showInformationMessage(
+        "No logs available. Make sure to set coder.proxyLogDirectory to get logs.",
+        this.workspaceLogPath || "<unset>",
+      )
       return
     }
     const uri = vscode.Uri.file(this.workspaceLogPath)

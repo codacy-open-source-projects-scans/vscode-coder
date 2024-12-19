@@ -1,3 +1,4 @@
+import { spawn } from "child_process"
 import { Api } from "coder/site/src/api/api"
 import { ProvisionerJobLog, Workspace } from "coder/site/src/api/typesGenerated"
 import fs from "fs/promises"
@@ -10,12 +11,28 @@ import { getProxyForUrl } from "./proxy"
 import { Storage } from "./storage"
 import { expandPath } from "./util"
 
+/**
+ * Return whether the API will need a token for authorization.
+ * If mTLS is in use (as specified by the cert or key files being set) then
+ * token authorization is disabled.  Otherwise, it is enabled.
+ */
+export function needToken(): boolean {
+  const cfg = vscode.workspace.getConfiguration()
+  const certFile = expandPath(String(cfg.get("coder.tlsCertFile") ?? "").trim())
+  const keyFile = expandPath(String(cfg.get("coder.tlsKeyFile") ?? "").trim())
+  return !certFile && !keyFile
+}
+
+/**
+ * Create a new agent based off the current settings.
+ */
 async function createHttpAgent(): Promise<ProxyAgent> {
   const cfg = vscode.workspace.getConfiguration()
   const insecure = Boolean(cfg.get("coder.insecure"))
   const certFile = expandPath(String(cfg.get("coder.tlsCertFile") ?? "").trim())
   const keyFile = expandPath(String(cfg.get("coder.tlsKeyFile") ?? "").trim())
   const caFile = expandPath(String(cfg.get("coder.tlsCaFile") ?? "").trim())
+  const altHost = expandPath(String(cfg.get("coder.tlsAltHost") ?? "").trim())
 
   return new ProxyAgent({
     // Called each time a request is made.
@@ -26,13 +43,23 @@ async function createHttpAgent(): Promise<ProxyAgent> {
     cert: certFile === "" ? undefined : await fs.readFile(certFile),
     key: keyFile === "" ? undefined : await fs.readFile(keyFile),
     ca: caFile === "" ? undefined : await fs.readFile(caFile),
+    servername: altHost === "" ? undefined : altHost,
     // rejectUnauthorized defaults to true, so we need to explicitly set it to
     // false if we want to allow self-signed certificates.
     rejectUnauthorized: !insecure,
   })
 }
 
+// The agent is a singleton so we only have to listen to the configuration once
+// (otherwise we would have to carefully dispose agents to remove their
+// configuration listeners), and to share the connection pool.
 let agent: Promise<ProxyAgent> | undefined = undefined
+
+/**
+ * Get the existing agent or create one if necessary.  On settings change,
+ * recreate the agent.  The agent on the client is not automatically updated;
+ * this must be called before every request to get the latest agent.
+ */
 async function getHttpAgent(): Promise<ProxyAgent> {
   if (!agent) {
     vscode.workspace.onDidChangeConfiguration((e) => {
@@ -42,7 +69,8 @@ async function getHttpAgent(): Promise<ProxyAgent> {
         e.affectsConfiguration("coder.insecure") ||
         e.affectsConfiguration("coder.tlsCertFile") ||
         e.affectsConfiguration("coder.tlsKeyFile") ||
-        e.affectsConfiguration("coder.tlsCaFile")
+        e.affectsConfiguration("coder.tlsCaFile") ||
+        e.affectsConfiguration("coder.tlsAltHost")
       ) {
         agent = createHttpAgent()
       }
@@ -95,16 +123,13 @@ export async function makeCoderSdk(baseUrl: string, token: string | undefined, s
 /**
  * Start or update a workspace and return the updated workspace.
  */
-export async function startWorkspaceIfStoppedOrFailed(restClient: Api, workspace: Workspace): Promise<Workspace> {
-  // If the workspace requires the latest active template version, we should attempt
-  // to update that here.
-  // TODO: If param set changes, what do we do??
-  const versionID = workspace.template_require_active_version
-    ? // Use the latest template version
-      workspace.template_active_version_id
-    : // Default to not updating the workspace if not required.
-      workspace.latest_build.template_version_id
-
+export async function startWorkspaceIfStoppedOrFailed(
+  restClient: Api,
+  globalConfigDir: string,
+  binPath: string,
+  workspace: Workspace,
+  writeEmitter: vscode.EventEmitter<string>,
+): Promise<Workspace> {
   // Before we start a workspace, we make an initial request to check it's not already started
   const updatedWorkspace = await restClient.getWorkspace(workspace.id)
 
@@ -112,12 +137,52 @@ export async function startWorkspaceIfStoppedOrFailed(restClient: Api, workspace
     return updatedWorkspace
   }
 
-  const latestBuild = await restClient.startWorkspace(updatedWorkspace.id, versionID)
+  return new Promise((resolve, reject) => {
+    const startArgs = [
+      "--global-config",
+      globalConfigDir,
+      "start",
+      "--yes",
+      workspace.owner_name + "/" + workspace.name,
+    ]
+    const startProcess = spawn(binPath, startArgs)
 
-  return {
-    ...updatedWorkspace,
-    latest_build: latestBuild,
-  }
+    startProcess.stdout.on("data", (data: Buffer) => {
+      data
+        .toString()
+        .split(/\r*\n/)
+        .forEach((line: string) => {
+          if (line !== "") {
+            writeEmitter.fire(line.toString() + "\r\n")
+          }
+        })
+    })
+
+    let capturedStderr = ""
+    startProcess.stderr.on("data", (data: Buffer) => {
+      data
+        .toString()
+        .split(/\r*\n/)
+        .forEach((line: string) => {
+          if (line !== "") {
+            writeEmitter.fire(line.toString() + "\r\n")
+            capturedStderr += line.toString() + "\n"
+          }
+        })
+    })
+
+    startProcess.on("close", (code: number) => {
+      if (code === 0) {
+        resolve(restClient.getWorkspace(workspace.id))
+      } else {
+        let errorText = `"${startArgs.join(" ")}" exited with code ${code}`
+        if (capturedStderr !== "") {
+          errorText += `: ${capturedStderr}`
+        }
+        reject(new Error(errorText))
+      }
+    })
+  })
 }
 
 /**
