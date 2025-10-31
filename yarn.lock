@@ -2582,7 +2582,8 @@ cockatiel@^3.1.2:
 
 "coder@https://github.com/coder/coder#main":
   version "0.0.0"
-  resolved "https://github.com/coder/coder#2efb8088f4d923d1884fe8947dc338f9d179693b"
+  uid "7b6e72438b697023109bedfa386d48b9472f0586"
+  resolved "https://github.com/coder/coder#7b6e72438b697023109bedfa386d48b9472f0586"
 
 collapse-white-space@^1.0.2:
   version "1.0.6"
