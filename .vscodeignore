@@ -1,0 +1,42 @@
+# Test and coverage output
+out/**
+coverage/**
+.nyc_output/**
+
+# Development files
+src/**
+test/**
+**/*.ts
+**/*.map
+
+# Configuration files
+.vscode/**
+.vscode-test/**
+.vscode-test.mjs
+tsconfig.json
+.eslintrc.json
+.editorconfig
+.prettierignore
+.eslintignore
+**/.gitignore
+**/.git-blame-ignore-revs
+
+# Package manager files
+yarn.lock
+
+# Nix/flake files
+flake.nix
+flake.lock
+*.nix
+
+# Dependencies
+node_modules/**
+
+# Development tools and CI
+.github/**
+.claude/**
+
+# Documentation and media
+usage.md
+CLAUDE.md
+*.gif

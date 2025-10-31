@@ -1,0 +1,78 @@
+name: Release
+on:
+  push:
+    tags:
+      - "v*"
+      - "!v*-pre"
+
+permissions:
+  # Required to publish a release
+  contents: write
+  pull-requests: read
+
+jobs:
+  package:
+    name: Package
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          # Extract version from tag (remove 'v' prefix)
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Release version: $VERSION"
+
+      - name: Validate version matches package.json
+        run: |
+          TAG_VERSION="${{ steps.version.outputs.version }}"
+          PACKAGE_VERSION=$(node -e "console.log(require('./package.json').version)")
+
+          if [ "$TAG_VERSION" != "$PACKAGE_VERSION" ]; then
+            echo "Error: Tag version ($TAG_VERSION) does not match package.json version ($PACKAGE_VERSION)"
+            echo "Please ensure the tag version matches the version in package.json"
+            exit 1
+          fi
+
+          echo "Version validation successful: $TAG_VERSION"
+
+      - name: Install dependencies
+        run: |
+          yarn
+          npm install -g @vscode/vsce
+
+      - name: Setup package path
+        id: setup
+        run: |
+          EXTENSION_NAME=$(node -e "console.log(require('./package.json').name)")
+          PACKAGE_NAME="${EXTENSION_NAME}-${{ steps.version.outputs.version }}.vsix"
+          echo "packageName=$PACKAGE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Package extension
+        run: vsce package --out "${{ steps.setup.outputs.packageName }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: extension-${{ steps.version.outputs.version }}
+          path: ${{ steps.setup.outputs.packageName }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish Extension and Create Release
+    needs: package
+    uses: ./.github/workflows/publish-extension.yaml
+    with:
+      version: ${{ needs.package.outputs.version }}
+      isPreRelease: false
+    secrets:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      OVSX_PAT: ${{ secrets.OVSX_PAT }}
