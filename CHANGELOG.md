@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## [v1.11.4](https://github.com/coder/vscode-coder/releases/tag/v1.11.4) 2025-11-20
+
+### Fixed
+
+- Add support for `google.antigravity-remote-openssh` Remote SSH extension.
+
 ### Changed
 
 - Improved workspace connection progress messages and enhanced the workspace build terminal
