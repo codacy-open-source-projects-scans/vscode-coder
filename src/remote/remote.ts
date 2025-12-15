@@ -4,12 +4,10 @@ import {
 	type Workspace,
 	type WorkspaceAgent,
 } from "coder/site/src/api/typesGenerated";
-import find from "find-process";
 import * as jsonc from "jsonc-parser";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import prettyBytes from "pretty-bytes";
 import * as semver from "semver";
 import * as vscode from "vscode";
 
@@ -22,6 +20,7 @@ import {
 import { extractAgents } from "../api/api-helper";
 import { CoderApi } from "../api/coderApi";
 import { needToken } from "../api/utils";
+import { getGlobalFlags, getSshFlags } from "../cliConfig";
 import { type Commands } from "../commands";
 import { type CliManager } from "../core/cliManager";
 import * as cliUtils from "../core/cliUtils";
@@ -29,19 +28,18 @@ import { type ServiceContainer } from "../core/container";
 import { type ContextManager } from "../core/contextManager";
 import { type PathResolver } from "../core/pathResolver";
 import { featureSetForVersion, type FeatureSet } from "../featureSet";
-import { getGlobalFlags } from "../globalFlags";
 import { Inbox } from "../inbox";
 import { type Logger } from "../logging/logger";
 import {
 	AuthorityPrefix,
 	escapeCommandArg,
 	expandPath,
-	findPort,
 	parseRemoteAuthority,
 } from "../util";
 import { WorkspaceMonitor } from "../workspace/workspaceMonitor";
 
 import { SSHConfig, type SSHValues, mergeSSHConfigValues } from "./sshConfig";
+import { SshProcessMonitor } from "./sshProcess";
 import { computeSSHProperties, sshSupportsSetEnv } from "./sshSupport";
 import { WorkspaceStateMachine } from "./workspaceStateMachine";
 
@@ -109,6 +107,7 @@ export class Remote {
 	public async setup(
 		remoteAuthority: string,
 		firstConnect: boolean,
+		remoteSshExtensionId: string,
 	): Promise<RemoteDetails | undefined> {
 		const parts = parseRemoteAuthority(remoteAuthority);
 		if (!parts) {
@@ -148,7 +147,7 @@ export class Remote {
 			]);
 
 			if (result.type === "login") {
-				return this.setup(remoteAuthority, firstConnect);
+				return this.setup(remoteAuthority, firstConnect, remoteSshExtensionId);
 			} else if (!result.userChoice) {
 				// User declined to log in.
 				await this.closeRemote();
@@ -156,7 +155,7 @@ export class Remote {
 			} else {
 				// Log in then try again.
 				await this.commands.login({ url: baseUrlRaw, label: parts.label });
-				return this.setup(remoteAuthority, firstConnect);
+				return this.setup(remoteAuthority, firstConnect, remoteSshExtensionId);
 			}
 		};
 
@@ -485,30 +484,24 @@ export class Remote {
 				throw error;
 			}
 
-			// TODO: This needs to be reworked; it fails to pick up reconnects.
-			this.findSSHProcessID().then(async (pid) => {
-				if (!pid) {
-					// TODO: Show an error here!
-					return;
-				}
-				disposables.push(this.showNetworkUpdates(pid));
-				if (logDir) {
-					const logFiles = await fs.readdir(logDir);
-					const logFileName = logFiles
-						.reverse()
-						.find(
-							(file) => file === `${pid}.log` || file.endsWith(`-${pid}.log`),
-						);
-					this.commands.workspaceLogPath = logFileName
-						? path.join(logDir, logFileName)
-						: undefined;
-				} else {
-					this.commands.workspaceLogPath = undefined;
-				}
+			// Monitor SSH process and display network status
+			const sshMonitor = SshProcessMonitor.start({
+				sshHost: parts.host,
+				networkInfoPath: this.pathResolver.getNetworkInfoPath(),
+				proxyLogDir: logDir || undefined,
+				logger: this.logger,
+				codeLogDir: this.pathResolver.getCodeLogDir(),
+				remoteSshExtensionId,
 			});
+			disposables.push(sshMonitor);
 
-			// Register the label formatter again because SSH overrides it!
+			this.commands.workspaceLogPath = sshMonitor.getLogFilePath();
+
 			disposables.push(
+				sshMonitor.onLogFilePathChange((newPath) => {
+					this.commands.workspaceLogPath = newPath;
+				}),
+				// Register the label formatter again because SSH overrides it!
 				vscode.extensions.onDidChange(() => {
 					// Dispose previous label formatter
 					labelFormatterDisposable.dispose();
@@ -521,6 +514,18 @@ export class Remote {
 				}),
 				...(await this.createAgentMetadataStatusBar(agent, workspaceClient)),
 			);
+
+			const settingsToWatch = [
+				{ setting: "coder.globalFlags", title: "Global flags" },
+				{ setting: "coder.sshFlags", title: "SSH flags" },
+			];
+			if (featureSet.proxyLogDirectory) {
+				settingsToWatch.push({
+					setting: "coder.proxyLogDirectory",
+					title: "Proxy log directory",
+				});
+			}
+			disposables.push(this.watchSettings(settingsToWatch));
 		} catch (ex) {
 			// Whatever error happens, make sure we clean up the disposables in case of failure
 			disposables.forEach((d) => d.dispose());
@@ -559,8 +564,10 @@ export class Remote {
 	}
 
 	/**
-	 * Return the --log-dir argument value for the ProxyCommand.  It may be an
+	 * Return the --log-dir argument value for the ProxyCommand. It may be an
 	 * empty string if the setting is not set or the cli does not support it.
+	 *
+	 * Value defined in the "coder.sshFlags" setting is not considered.
 	 */
 	private getLogDir(featureSet: FeatureSet): string {
 		if (!featureSet.proxyLogDirectory) {
@@ -576,16 +583,79 @@ export class Remote {
 	}
 
 	/**
-	 * Formats the --log-dir argument for the ProxyCommand after making sure it
+	 * Builds the ProxyCommand for SSH connections to Coder workspaces.
+	 * Uses `coder ssh` for modern deployments with wildcard support,
+	 * or falls back to `coder vscodessh` for older deployments.
+	 */
+	private async buildProxyCommand(
+		binaryPath: string,
+		label: string,
+		hostPrefix: string,
+		logDir: string,
+		useWildcardSSH: boolean,
+	): Promise<string> {
+		const vscodeConfig = vscode.workspace.getConfiguration();
+
+		const escapedBinaryPath = escapeCommandArg(binaryPath);
+		const globalConfig = getGlobalFlags(
+			vscodeConfig,
+			this.pathResolver.getGlobalConfigDir(label),
+		);
+		const logArgs = await this.getLogArgs(logDir);
+
+		if (useWildcardSSH) {
+			// User SSH flags are included first; internally-managed flags
+			// are appended last so they take precedence.
+			const userSshFlags = getSshFlags(vscodeConfig);
+			// Make sure to update the `coder.sshFlags` description if we add more internal flags here!
+			const internalFlags = [
+				"--stdio",
+				"--usage-app=vscode",
+				"--network-info-dir",
+				escapeCommandArg(this.pathResolver.getNetworkInfoPath()),
+				...logArgs,
+				"--ssh-host-prefix",
+				hostPrefix,
+				"%h",
+			];
+
+			const allFlags = [...userSshFlags, ...internalFlags];
+			return `${escapedBinaryPath} ${globalConfig.join(" ")} ssh ${allFlags.join(" ")}`;
+		} else {
+			const networkInfoDir = escapeCommandArg(
+				this.pathResolver.getNetworkInfoPath(),
+			);
+			const sessionTokenFile = escapeCommandArg(
+				this.pathResolver.getSessionTokenPath(label),
+			);
+			const urlFile = escapeCommandArg(this.pathResolver.getUrlPath(label));
+
+			const sshFlags = [
+				"--network-info-dir",
+				networkInfoDir,
+				...logArgs,
+				"--session-token-file",
+				sessionTokenFile,
+				"--url-file",
+				urlFile,
+				"%h",
+			];
+
+			return `${escapedBinaryPath} ${globalConfig.join(" ")} vscodessh ${sshFlags.join(" ")}`;
+		}
+	}
+
+	/**
+	 * Returns the --log-dir argument for the ProxyCommand after making sure it
 	 * has been created.
 	 */
-	private async formatLogArg(logDir: string): Promise<string> {
+	private async getLogArgs(logDir: string): Promise<string[]> {
 		if (!logDir) {
-			return "";
+			return [];
 		}
 		await fs.mkdir(logDir, { recursive: true });
 		this.logger.info("SSH proxy diagnostics are being written to", logDir);
-		return ` --log-dir ${escapeCommandArg(logDir)} -v`;
+		return ["--log-dir", escapeCommandArg(logDir), "-v"];
 	}
 
 	// updateSSHConfig updates the SSH configuration with a wildcard that handles
@@ -671,15 +741,13 @@ export class Remote {
 			? `${AuthorityPrefix}.${label}--`
 			: `${AuthorityPrefix}--`;
 
-		const globalConfigs = this.globalConfigs(label);
-
-		const proxyCommand = featureSet.wildcardSSH
-			? `${escapeCommandArg(binaryPath)}${globalConfigs} ssh --stdio --usage-app=vscode --disable-autostart --network-info-dir ${escapeCommandArg(this.pathResolver.getNetworkInfoPath())}${await this.formatLogArg(logDir)} --ssh-host-prefix ${hostPrefix} %h`
-			: `${escapeCommandArg(binaryPath)}${globalConfigs} vscodessh --network-info-dir ${escapeCommandArg(
-					this.pathResolver.getNetworkInfoPath(),
-				)}${await this.formatLogArg(logDir)} --session-token-file ${escapeCommandArg(this.pathResolver.getSessionTokenPath(label))} --url-file ${escapeCommandArg(
-					this.pathResolver.getUrlPath(label),
-				)} %h`;
+		const proxyCommand = await this.buildProxyCommand(
+			binaryPath,
+			label,
+			hostPrefix,
+			logDir,
+			featureSet.wildcardSSH,
+		);
 
 		const sshValues: SSHValues = {
 			Host: hostPrefix + `*`,
@@ -732,181 +800,27 @@ export class Remote {
 		return sshConfig.getRaw();
 	}
 
-	private globalConfigs(label: string): string {
-		const vscodeConfig = vscode.workspace.getConfiguration();
-		const args = getGlobalFlags(
-			vscodeConfig,
-			this.pathResolver.getGlobalConfigDir(label),
-		);
-		return ` ${args.join(" ")}`;
-	}
-
-	// showNetworkUpdates finds the SSH process ID that is being used by this
-	// workspace and reads the file being created by the Coder CLI.
-	private showNetworkUpdates(sshPid: number): vscode.Disposable {
-		const networkStatus = vscode.window.createStatusBarItem(
-			vscode.StatusBarAlignment.Left,
-			1000,
-		);
-		const networkInfoFile = path.join(
-			this.pathResolver.getNetworkInfoPath(),
-			`${sshPid}.json`,
-		);
-
-		const updateStatus = (network: {
-			p2p: boolean;
-			latency: number;
-			preferred_derp: string;
-			derp_latency: { [key: string]: number };
-			upload_bytes_sec: number;
-			download_bytes_sec: number;
-			using_coder_connect: boolean;
-		}) => {
-			let statusText = "$(globe) ";
-
-			// Coder Connect doesn't populate any other stats
-			if (network.using_coder_connect) {
-				networkStatus.text = statusText + "Coder Connect ";
-				networkStatus.tooltip = "You're connected using Coder Connect.";
-				networkStatus.show();
-				return;
+	private watchSettings(
+		settings: Array<{ setting: string; title: string }>,
+	): vscode.Disposable {
+		return vscode.workspace.onDidChangeConfiguration((e) => {
+			for (const { setting, title } of settings) {
+				if (!e.affectsConfiguration(setting)) {
+					continue;
+				}
+				vscode.window
+					.showInformationMessage(
+						`${title} setting changed. Reload window to apply.`,
+						"Reload",
+					)
+					.then((action) => {
+						if (action === "Reload") {
+							vscode.commands.executeCommand("workbench.action.reloadWindow");
+						}
+					});
+				break;
 			}
-
-			if (network.p2p) {
-				statusText += "Direct ";
-				networkStatus.tooltip = "You're connected peer-to-peer ✨.";
-			} else {
-				statusText += network.preferred_derp + " ";
-				networkStatus.tooltip =
-					"You're connected through a relay 🕵.\nWe'll switch over to peer-to-peer when available.";
-			}
-			networkStatus.tooltip +=
-				"\n\nDownload ↓ " +
-				prettyBytes(network.download_bytes_sec, {
-					bits: true,
-				}) +
-				"/s • Upload ↑ " +
-				prettyBytes(network.upload_bytes_sec, {
-					bits: true,
-				}) +
-				"/s\n";
-
-			if (!network.p2p) {
-				const derpLatency = network.derp_latency[network.preferred_derp];
-
-				networkStatus.tooltip += `You ↔ ${derpLatency.toFixed(2)}ms ↔ ${network.preferred_derp} ↔ ${(network.latency - derpLatency).toFixed(2)}ms ↔ Workspace`;
-
-				let first = true;
-				Object.keys(network.derp_latency).forEach((region) => {
-					if (region === network.preferred_derp) {
-						return;
-					}
-					if (first) {
-						networkStatus.tooltip += `\n\nOther regions:`;
-						first = false;
-					}
-					networkStatus.tooltip += `\n${region}: ${Math.round(network.derp_latency[region] * 100) / 100}ms`;
-				});
-			}
-
-			statusText += "(" + network.latency.toFixed(2) + "ms)";
-			networkStatus.text = statusText;
-			networkStatus.show();
-		};
-		let disposed = false;
-		const periodicRefresh = () => {
-			if (disposed) {
-				return;
-			}
-			fs.readFile(networkInfoFile, "utf8")
-				.then((content) => {
-					return JSON.parse(content);
-				})
-				.then((parsed) => {
-					try {
-						updateStatus(parsed);
-					} catch {
-						// Ignore
-					}
-				})
-				.catch(() => {
-					// TODO: Log a failure here!
-				})
-				.finally(() => {
-					// This matches the write interval of `coder vscodessh`.
-					setTimeout(periodicRefresh, 3000);
-				});
-		};
-		periodicRefresh();
-
-		return {
-			dispose: () => {
-				disposed = true;
-				networkStatus.dispose();
-			},
-		};
-	}
-
-	// findSSHProcessID returns the currently active SSH process ID that is
-	// powering the remote SSH connection.
-	private async findSSHProcessID(timeout = 15000): Promise<number | undefined> {
-		const search = async (logPath: string): Promise<number | undefined> => {
-			// This searches for the socksPort that Remote SSH is connecting to. We do
-			// this to find the SSH process that is powering this connection. That SSH
-			// process will be logging network information periodically to a file.
-			const text = await fs.readFile(logPath, "utf8");
-			const port = findPort(text);
-			if (!port) {
-				return;
-			}
-			const processes = await find("port", port);
-			if (processes.length < 1) {
-				return;
-			}
-			const process = processes[0];
-			return process.pid;
-		};
-		const start = Date.now();
-		const loop = async (): Promise<number | undefined> => {
-			if (Date.now() - start > timeout) {
-				return undefined;
-			}
-			// Loop until we find the remote SSH log for this window.
-			const filePath = await this.getRemoteSSHLogPath();
-			if (!filePath) {
-				return new Promise((resolve) => setTimeout(() => resolve(loop()), 500));
-			}
-			// Then we search the remote SSH log until we find the port.
-			const result = await search(filePath);
-			if (!result) {
-				return new Promise((resolve) => setTimeout(() => resolve(loop()), 500));
-			}
-			return result;
-		};
-		return loop();
-	}
-
-	/**
-	 * Returns the log path for the "Remote - SSH" output panel.  There is no VS
-	 * Code API to get the contents of an output panel.  We use this to get the
-	 * active port so we can display network information.
-	 */
-	private async getRemoteSSHLogPath(): Promise<string | undefined> {
-		const upperDir = path.dirname(this.pathResolver.getCodeLogDir());
-		// Node returns these directories sorted already!
-		const dirs = await fs.readdir(upperDir);
-		const latestOutput = dirs
-			.reverse()
-			.filter((dir) => dir.startsWith("output_logging_"));
-		if (latestOutput.length === 0) {
-			return undefined;
-		}
-		const dir = await fs.readdir(path.join(upperDir, latestOutput[0]));
-		const remoteSSH = dir.filter((file) => file.indexOf("Remote - SSH") !== -1);
-		if (remoteSSH.length === 0) {
-			return undefined;
-		}
-		return path.join(upperDir, latestOutput[0], remoteSSH[0]);
+		});
 	}
 
 	/**

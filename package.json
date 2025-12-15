@@ -1,7 +1,7 @@
 {
 	"name": "coder-remote",
 	"displayName": "Coder",
-	"version": "1.11.4",
+	"version": "1.11.5",
 	"description": "Open any workspace with a single click.",
 	"categories": [
 		"Other"
@@ -119,6 +119,16 @@
 					"markdownDescription": "Disable Coder CLI signature verification, which can be useful if you run an unsigned fork of the binary.",
 					"type": "boolean",
 					"default": false
+				},
+				"coder.sshFlags": {
+					"markdownDescription": "Additional flags to pass to the `coder ssh` command when establishing SSH connections. Enter each flag as a separate array item; values are passed verbatim and in order. See the [CLI ssh reference](https://coder.com/docs/reference/cli/ssh) for available flags.\n\nNote: `--network-info-dir` and `--ssh-host-prefix` are ignored (managed internally). Prefer `#coder.proxyLogDirectory#` over `--log-dir`/`-l` for full functionality.",
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"default": [
+						"--disable-autostart"
+					]
 				},
 				"coder.globalFlags": {
 					"markdownDescription": "Global flags to pass to every Coder CLI invocation. Enter each flag as a separate array item; values are passed verbatim and in order. Do **not** include the `coder` command itself. See the [CLI reference](https://coder.com/docs/reference/cli) for available global flags.\n\nNote that for `--header-command`, precedence is: `#coder.headerCommand#` setting, then `CODER_HEADER_COMMAND` environment variable, then the value specified here. The `--global-config` flag is explicitly ignored.",
@@ -347,7 +357,7 @@
 		"axios": "1.12.2",
 		"date-fns": "^3.6.0",
 		"eventsource": "^3.0.6",
-		"find-process": "https://github.com/coder/find-process#fix/sequoia-compat",
+		"find-process": "^2.0.0",
 		"jsonc-parser": "^3.3.1",
 		"openpgp": "^6.2.2",
 		"pretty-bytes": "^7.1.0",
@@ -372,11 +382,11 @@
 		"@vitest/coverage-v8": "^3.2.4",
 		"@vscode/test-cli": "^0.0.12",
 		"@vscode/test-electron": "^2.5.2",
-		"@vscode/vsce": "^3.7.0",
+		"@vscode/vsce": "^3.7.1",
 		"bufferutil": "^4.0.9",
 		"coder": "https://github.com/coder/coder#main",
-		"dayjs": "^1.11.13",
-		"electron": "^39.1.2",
+		"dayjs": "^1.11.19",
+		"electron": "^39.2.6",
 		"eslint": "^8.57.1",
 		"eslint-config-prettier": "^10.1.8",
 		"eslint-import-resolver-typescript": "^4.4.4",

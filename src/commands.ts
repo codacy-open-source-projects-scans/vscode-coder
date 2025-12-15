@@ -10,6 +10,7 @@ import * as vscode from "vscode";
 import { createWorkspaceIdentifier, extractAgents } from "./api/api-helper";
 import { CoderApi } from "./api/coderApi";
 import { needToken } from "./api/utils";
+import { getGlobalFlags } from "./cliConfig";
 import { type CliManager } from "./core/cliManager";
 import { type ServiceContainer } from "./core/container";
 import { type ContextManager } from "./core/contextManager";
@@ -17,7 +18,6 @@ import { type MementoManager } from "./core/mementoManager";
 import { type PathResolver } from "./core/pathResolver";
 import { type SecretsManager } from "./core/secretsManager";
 import { CertificateError } from "./error";
-import { getGlobalFlags } from "./globalFlags";
 import { type Logger } from "./logging/logger";
 import { maybeAskAgent, maybeAskUrl } from "./promptUtils";
 import { escapeCommandArg, toRemoteAuthority, toSafeHost } from "./util";
@@ -579,7 +579,6 @@ export class Commands {
 				detail: `Update ${createWorkspaceIdentifier(this.workspace)} to the latest version?\n\nUpdating will restart your workspace which stops any running processes and may result in the loss of unsaved work.`,
 			},
 			"Update",
-			"Cancel",
 		);
 		if (action === "Update") {
 			await this.workspaceRestClient.updateWorkspaceVersion(this.workspace);
