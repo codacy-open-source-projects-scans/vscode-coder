@@ -1,5 +1,5 @@
 import { type AxiosInstance } from "axios";
-import { type FetchLikeInit, type FetchLikeResponse } from "eventsource";
+import { type EventSourceFetchInit, type FetchLikeResponse } from "eventsource";
 import { type IncomingMessage } from "node:http";
 
 /**
@@ -9,16 +9,19 @@ import { type IncomingMessage } from "node:http";
 export function createStreamingFetchAdapter(
 	axiosInstance: AxiosInstance,
 	configHeaders?: Record<string, string>,
-): (url: string | URL, init?: FetchLikeInit) => Promise<FetchLikeResponse> {
+): (
+	url: string | URL,
+	init?: EventSourceFetchInit,
+) => Promise<FetchLikeResponse> {
 	return async (
 		url: string | URL,
-		init?: FetchLikeInit,
+		init?: EventSourceFetchInit,
 	): Promise<FetchLikeResponse> => {
 		const urlStr = url.toString();
 
 		const response = await axiosInstance.request<IncomingMessage>({
 			url: urlStr,
-			signal: init?.signal,
+			signal: init?.signal as AbortSignal | undefined,
 			headers: { ...init?.headers, ...configHeaders },
 			responseType: "stream",
 			validateStatus: () => true, // Don't throw on any status code
@@ -53,17 +56,21 @@ export function createStreamingFetchAdapter(
 			},
 		});
 
+		const castRequest = response.request as
+			| { res?: { responseUrl?: string } }
+			| undefined;
+
 		return {
 			body: {
 				getReader: () => stream.getReader(),
 			},
 			url: urlStr,
 			status: response.status,
-			redirected: response.request?.res?.responseUrl !== urlStr,
+			redirected: castRequest?.res?.responseUrl !== urlStr,
 			headers: {
 				get: (name: string) => {
-					const value = response.headers[name.toLowerCase()];
-					return value === undefined ? null : String(value);
+					const value = response.headers[name.toLowerCase()] as unknown;
+					return typeof value === "string" ? value : null;
 				},
 			},
 		};

@@ -100,7 +100,7 @@ describe("SseConnection", () => {
 			const mockAxios = axios.create();
 			const mockLogger = createMockLogger();
 			const connection = createConnection(mockAxios, mockLogger);
-			const events: ParsedMessageEvent<ServerSentEvent>[] = [];
+			const events: Array<ParsedMessageEvent<ServerSentEvent>> = [];
 			connection.addEventListener("message", (event) => events.push(event));
 
 			await waitForNextTick();
@@ -195,7 +195,7 @@ describe("SseConnection", () => {
 			const mockAxios = axios.create();
 			const mockLogger = createMockLogger();
 			const connection = createConnection(mockAxios, mockLogger);
-			const events: ParsedMessageEvent<ServerSentEvent>[] = [];
+			const events: Array<ParsedMessageEvent<ServerSentEvent>> = [];
 
 			const removedHandler = () => {
 				throw new Error("Removed handler should not have been called!");
@@ -356,7 +356,9 @@ function createMockEventSource(
 }
 
 function setupEventSourceMock(es: Partial<EventSource>): void {
-	vi.mocked(EventSource).mockImplementation(() => es as EventSource);
+	vi.mocked(EventSource).mockImplementation(function () {
+		return es as EventSource;
+	});
 }
 
 function waitForNextTick(): Promise<void> {
