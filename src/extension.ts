@@ -11,7 +11,6 @@ import { AuthInterceptor } from "./api/authInterceptor";
 import { CoderApi } from "./api/coderApi";
 import { Commands } from "./commands";
 import { ServiceContainer } from "./core/container";
-import { type SecretsManager } from "./core/secretsManager";
 import { DeploymentManager } from "./deployment/deploymentManager";
 import { CertificateError } from "./error/certificateError";
 import { getErrorDetail, toError } from "./error/errorUtils";
@@ -19,6 +18,7 @@ import { OAuthSessionManager } from "./oauth/sessionManager";
 import { Remote } from "./remote/remote";
 import { getRemoteSshExtension } from "./remote/sshExtension";
 import { registerUriHandler } from "./uri/uriHandler";
+import { initVscodeProposed } from "./vscodeProposed";
 import {
 	WorkspaceProvider,
 	WorkspaceQuery,
@@ -54,7 +54,10 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 		);
 	}
 
-	const serviceContainer = new ServiceContainer(ctx, vscodeProposed);
+	// Initialize the global vscodeProposed module for use throughout the extension
+	initVscodeProposed(vscodeProposed);
+
+	const serviceContainer = new ServiceContainer(ctx);
 	ctx.subscriptions.push(serviceContainer);
 
 	const output = serviceContainer.getLogger();
@@ -185,12 +188,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 	const commands = new Commands(serviceContainer, client, deploymentManager);
 
 	ctx.subscriptions.push(
-		registerUriHandler(
-			serviceContainer,
-			deploymentManager,
-			commands,
-			vscodeProposed,
-		),
+		registerUriHandler(serviceContainer, deploymentManager, commands),
 		vscode.commands.registerCommand(
 			"coder.login",
 			commands.login.bind(commands),
@@ -243,7 +241,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 			showTreeViewSearch(ALL_WORKSPACES_TREE_ID),
 		),
 		vscode.commands.registerCommand("coder.debug.listDeployments", () =>
-			listStoredDeployments(secretsManager),
+			listStoredDeployments(serviceContainer),
 		),
 	);
 
@@ -387,26 +385,36 @@ async function showTreeViewSearch(id: string): Promise<void> {
 }
 
 async function listStoredDeployments(
-	secretsManager: SecretsManager,
+	serviceContainer: ServiceContainer,
 ): Promise<void> {
-	const hostnames = secretsManager.getKnownSafeHostnames();
-	if (hostnames.length === 0) {
-		vscode.window.showInformationMessage("No deployments stored.");
-		return;
-	}
+	const secretsManager = serviceContainer.getSecretsManager();
+	const output = serviceContainer.getLogger();
 
-	const selected = await vscode.window.showQuickPick(
-		hostnames.map((hostname) => ({
-			label: hostname,
-			description: "Click to forget",
-		})),
-		{ placeHolder: "Select a deployment to forget" },
-	);
+	try {
+		const hostnames = await secretsManager.getKnownSafeHostnames();
+		if (hostnames.length === 0) {
+			vscode.window.showInformationMessage("No deployments stored.");
+			return;
+		}
 
-	if (selected) {
-		await secretsManager.clearAllAuthData(selected.label);
-		vscode.window.showInformationMessage(
-			`Cleared auth data for ${selected.label}`,
+		const selected = await vscode.window.showQuickPick(
+			hostnames.map((hostname) => ({
+				label: hostname,
+				description: "Click to forget",
+			})),
+			{ placeHolder: "Select a deployment to forget" },
+		);
+
+		if (selected) {
+			await secretsManager.clearAllAuthData(selected.label);
+			vscode.window.showInformationMessage(
+				`Cleared auth data for ${selected.label}`,
+			);
+		}
+	} catch (error: unknown) {
+		output.error("Failed to list stored deployments", error);
+		vscode.window.showErrorMessage(
+			"Failed to list stored deployments. Storage may be corrupted.",
 		);
 	}
 }

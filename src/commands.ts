@@ -21,6 +21,7 @@ import { type Logger } from "./logging/logger";
 import { type LoginCoordinator } from "./login/loginCoordinator";
 import { maybeAskAgent, maybeAskUrl } from "./promptUtils";
 import { escapeCommandArg, toRemoteAuthority, toSafeHost } from "./util";
+import { vscodeProposed } from "./vscodeProposed";
 import {
 	AgentTreeItem,
 	type OpenableTreeItem,
@@ -28,7 +29,6 @@ import {
 } from "./workspace/workspacesProvider";
 
 export class Commands {
-	private readonly vscodeProposed: typeof vscode;
 	private readonly logger: Logger;
 	private readonly pathResolver: PathResolver;
 	private readonly mementoManager: MementoManager;
@@ -53,7 +53,6 @@ export class Commands {
 		private readonly extensionClient: CoderApi,
 		private readonly deploymentManager: DeploymentManager,
 	) {
-		this.vscodeProposed = serviceContainer.getVsCodeProposed();
 		this.logger = serviceContainer.getLogger();
 		this.pathResolver = serviceContainer.getPathResolver();
 		this.mementoManager = serviceContainer.getMementoManager();
@@ -86,7 +85,7 @@ export class Commands {
 		if (this.deploymentManager.isAuthenticated()) {
 			return;
 		}
-		this.logger.info("Logging in");
+		this.logger.debug("Logging in");
 
 		const currentDeployment = await this.secretsManager.getCurrentDeployment();
 		const url = await maybeAskUrl(
@@ -205,7 +204,7 @@ export class Commands {
 			return;
 		}
 
-		this.logger.info("Logging out");
+		this.logger.debug("Logging out");
 
 		await this.deploymentManager.clearDeployment();
 
@@ -492,7 +491,7 @@ export class Commands {
 		if (!this.workspace || !this.remoteWorkspaceClient) {
 			return;
 		}
-		const action = await this.vscodeProposed.window.showWarningMessage(
+		const action = await vscodeProposed.window.showWarningMessage(
 			"Update Workspace",
 			{
 				useCustom: true,
