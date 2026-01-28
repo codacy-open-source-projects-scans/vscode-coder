@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## [v1.12.2](https://github.com/coder/vscode-coder/releases/tag/v1.12.2) 2026-01-27
+
+### Added
+
+- Support for VS Code's built-in proxy settings: `http.noProxy` (as fallback when `coder.proxyBypass`
+  is not set), `http.proxyAuthorization`, and `http.proxyStrictSSL`.
+
+### Fixed
+
+- Fixed proxy scheme handling where URLs with schemes got duplicated and URLs without schemes
+  were not normalized.
+
+### Changed
+
+- WebSocket connections are now more robust and reconnect less frequently, only when truly
+  necessary, reducing unnecessary disconnections and improving stability.
+
 ## [v1.12.1](https://github.com/coder/vscode-coder/releases/tag/v1.12.1) 2026-01-23
 
 ### Fixed
