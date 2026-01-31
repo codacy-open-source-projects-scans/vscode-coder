@@ -218,6 +218,12 @@
 				"icon": "$(sign-out)"
 			},
 			{
+				"command": "coder.switchDeployment",
+				"title": "Switch Deployment",
+				"category": "Coder",
+				"icon": "$(arrow-swap)"
+			},
+			{
 				"command": "coder.open",
 				"title": "Open Workspace",
 				"category": "Coder",
@@ -282,9 +288,9 @@
 				"icon": "$(search)"
 			},
 			{
-				"command": "coder.debug.listDeployments",
-				"title": "List Stored Deployments",
-				"category": "Coder Debug"
+				"command": "coder.manageCredentials",
+				"title": "Manage Credentials",
+				"category": "Coder"
 			}
 		],
 		"menus": {
@@ -295,6 +301,10 @@
 				},
 				{
 					"command": "coder.logout",
+					"when": "coder.authenticated"
+				},
+				{
+					"command": "coder.switchDeployment",
 					"when": "coder.authenticated"
 				},
 				{
@@ -342,13 +352,16 @@
 					"when": "false"
 				},
 				{
-					"command": "coder.debug.listDeployments",
-					"when": "coder.devMode"
+					"command": "coder.manageCredentials"
 				}
 			],
 			"view/title": [
 				{
 					"command": "coder.logout",
+					"when": "coder.authenticated && view == myWorkspaces"
+				},
+				{
+					"command": "coder.switchDeployment",
 					"when": "coder.authenticated && view == myWorkspaces"
 				},
 				{
@@ -418,7 +431,7 @@
 	},
 	"dependencies": {
 		"@peculiar/x509": "^1.14.3",
-		"axios": "1.13.2",
+		"axios": "1.13.4",
 		"date-fns": "^4.1.0",
 		"eventsource": "^4.1.0",
 		"find-process": "^2.0.0",
@@ -430,7 +443,7 @@
 		"semver": "^7.7.3",
 		"ua-parser-js": "^1.0.41",
 		"ws": "^8.19.0",
-		"zod": "^4.3.5"
+		"zod": "^4.3.6"
 	},
 	"devDependencies": {
 		"@eslint/js": "^9.39.2",
