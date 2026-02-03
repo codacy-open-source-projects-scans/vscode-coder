@@ -66,6 +66,47 @@ workspaces if the user has the required permissions.
 There are also notifications for an outdated workspace and for workspaces that
 are close to shutting down.
 
+## Webviews
+
+The extension uses React-based webviews for rich UI panels, built with Vite and
+organized as a pnpm workspace in `packages/`.
+
+### Project Structure
+
+```text
+packages/
+├── webview-shared/      # Shared types, React hooks, and Vite config
+│   └── extension.d.ts   # Types exposed to extension (excludes React)
+└── tasks/               # Example webview (copy this for new webviews)
+
+src/webviews/
+├── util.ts          # getWebviewHtml() helper
+└── tasks/           # Extension-side provider for tasks panel
+```
+
+Key patterns:
+
+- **Type sharing**: Extension imports types from `@repo/webview-shared` via path mapping
+  to `extension.d.ts`. Webviews import directly from `@repo/webview-shared/react`.
+- **Message passing**: Use `postMessage()`/`useMessage()` hooks for communication.
+- **Lifecycle**: Dispose event listeners properly (see `TasksPanel.ts` for example).
+
+### Development
+
+```bash
+pnpm watch:all  # Rebuild extension and webviews on changes
+```
+
+Press F5 to launch the Extension Development Host. Use "Developer: Reload Webviews"
+to see webview changes.
+
+### Adding a New Webview
+
+1. Copy `packages/tasks` to `packages/<name>` and update the package name
+2. Create a provider in `src/webviews/<name>/` (see `TasksPanel.ts` for reference)
+3. Register the view in `package.json` under `contributes.views`
+4. Register the provider in `src/extension.ts`
+
 ## Testing
 
 There are a few ways you can test the "Open in VS Code" flow:
@@ -80,17 +121,41 @@ The link format is `vscode://coder.coder-remote/open?${query}`. For example:
 code --open-url 'vscode://coder.coder-remote/open?url=dev.coder.com&owner=my-username&workspace=my-ws&agent=my-agent'
 ```
 
-There are unit tests using `vitest` with mocked VS Code APIs:
+### Unit Tests
+
+The project uses Vitest with separate test configurations for extension and webview code:
 
 ```bash
-pnpm test:ci
+pnpm test:extension  # Extension tests (runs in Electron with mocked VS Code APIs)
+pnpm test:webview    # Webview tests (runs in jsdom)
+pnpm test:all        # Both extension and webview tests
+pnpm test:ci         # CI mode (same as test:all with CI=true)
 ```
 
-There are also integration tests that run inside a real VS Code instance:
+Test files are organized by type:
+
+```text
+test/
+├── unit/           # Extension unit tests
+├── webview/        # Webview unit tests (jsdom environment)
+├── integration/    # Integration tests (real VS Code)
+└── mocks/          # Shared test mocks
+```
+
+### Integration Tests
+
+Integration tests run inside a real VS Code instance:
 
 ```bash
 pnpm test:integration
 ```
+
+**Limitations:**
+
+- Must use Mocha (VS Code test runner requirement), not Vitest
+- Cannot run while another VS Code instance is open (they share state)
+- Requires closing VS Code or running in a clean environment
+- Test files in `test/integration/` are compiled to `out/` before running
 
 ## Development
 

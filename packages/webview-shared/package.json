@@ -1,0 +1,44 @@
+{
+	"name": "@repo/webview-shared",
+	"version": "1.0.0",
+	"description": "Types and utilities for Coder webviews",
+	"private": true,
+	"type": "module",
+	"exports": {
+		".": {
+			"types": "./src/index.ts",
+			"default": "./src/index.ts"
+		},
+		"./api": {
+			"types": "./src/api.ts",
+			"default": "./src/api.ts"
+		},
+		"./logger": {
+			"types": "./src/logger.ts",
+			"default": "./src/logger.ts"
+		},
+		"./react": {
+			"types": "./src/react/index.ts",
+			"default": "./src/react/index.ts"
+		}
+	},
+	"peerDependencies": {
+		"@vscode-elements/react-elements": "catalog:",
+		"react": "catalog:"
+	},
+	"peerDependenciesMeta": {
+		"@vscode-elements/react-elements": {
+			"optional": true
+		},
+		"react": {
+			"optional": true
+		}
+	},
+	"devDependencies": {
+		"@types/react": "catalog:",
+		"@types/vscode-webview": "^1.57.5",
+		"@vscode-elements/react-elements": "catalog:",
+		"react": "catalog:",
+		"typescript": "catalog:"
+	}
+}
