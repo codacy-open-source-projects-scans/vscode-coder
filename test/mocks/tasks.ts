@@ -92,6 +92,7 @@ export function template(overrides: Partial<Template> = {}): Template {
 			start: { P50: null, P95: null },
 			stop: { P50: null, P95: null },
 		},
+		deleted: false,
 		description: "Test template",
 		deprecated: false,
 		deprecation_message: "",
@@ -151,8 +152,7 @@ export function taskDetails(
 	const { task: taskOverrides, ...rest } = overrides;
 	return {
 		task: task(taskOverrides ?? {}),
-		logs: [],
-		logsStatus: "ok",
+		logs: { status: "ok", logs: [] },
 		canPause: true,
 		pauseDisabled: false,
 		canResume: false,
