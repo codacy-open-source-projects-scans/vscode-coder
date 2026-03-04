@@ -17,8 +17,7 @@ export type { Preset, Task, TaskLogEntry, TaskState, TaskStatus, Template };
 export interface TaskTemplate {
 	id: string;
 	name: string;
-	displayName: string;
-	icon: string;
+	description: string;
 	activeVersionId: string;
 	presets: TaskPreset[];
 }
@@ -26,12 +25,18 @@ export interface TaskTemplate {
 export interface TaskPreset {
 	id: string;
 	name: string;
+	description: string;
 	isDefault: boolean;
 }
 
 /** Result of fetching task logs: either logs or an error/unavailable state. */
 export type TaskLogs =
-	| { status: "ok"; logs: readonly TaskLogEntry[] }
+	| {
+			status: "ok";
+			logs: readonly TaskLogEntry[];
+			snapshot?: boolean;
+			snapshotAt?: string;
+	  }
 	| { status: "not_available" }
 	| { status: "error" };
 

@@ -1,4 +1,4 @@
-import type { Task, TaskPermissions, TaskStatus } from "./types";
+import type { Task, TaskPermissions, TaskState, TaskStatus } from "./types";
 
 export function getTaskLabel(task: Task): string {
 	return task.display_name || task.name || task.id;
@@ -27,8 +27,7 @@ export function getTaskPermissions(task: Task): TaskPermissions {
 	const hasWorkspace = task.workspace_id !== null;
 	const status = task.status;
 	const canSendMessage =
-		task.status === "paused" ||
-		(task.status === "active" && task.current_state?.state !== "working");
+		task.status === "active" && task.current_state?.state !== "working";
 	return {
 		canPause: hasWorkspace && PAUSABLE_STATUSES.includes(status),
 		pauseDisabled: PAUSE_DISABLED_STATUSES.includes(status),
@@ -44,15 +43,20 @@ export function isTaskWorking(task: Task): boolean {
 
 /**
  * Task statuses where logs won't change (stable/terminal states).
- * "complete" is a TaskState (sub-state of active), checked separately.
  */
 const STABLE_STATUSES: readonly TaskStatus[] = ["error", "paused"];
+
+/**
+ * Task states where logs won't change (stable/terminal states).
+ */
+const STABLE_STATES: readonly TaskState[] = ["failed", "idle"];
 
 /** Whether a task is in a stable state where its logs won't change. */
 export function isStableTask(task: Task): boolean {
 	return (
 		STABLE_STATUSES.includes(task.status) ||
-		(task.current_state !== null && task.current_state.state !== "working")
+		(task.current_state !== null &&
+			STABLE_STATES.includes(task.current_state.state))
 	);
 }
 
@@ -74,4 +78,15 @@ export function isAgentStarting(task: Task): boolean {
 /** Whether the task's workspace is still starting up (building or agent initializing). */
 export function isWorkspaceStarting(task: Task): boolean {
 	return isBuildingWorkspace(task) || isAgentStarting(task);
+}
+
+/** Label for the log preview header, matching the Coder dashboard pattern. */
+export function logPreviewLabel(count: number): string {
+	if (count === 0) {
+		return "AI chat messages";
+	}
+	if (count === 1) {
+		return "Last message of AI chat";
+	}
+	return `Last ${count} messages of AI chat`;
 }

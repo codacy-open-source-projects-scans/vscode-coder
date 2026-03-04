@@ -6,6 +6,7 @@ import {
 	isBuildingWorkspace,
 	isStableTask,
 	isTaskWorking,
+	logPreviewLabel,
 	type Task,
 	type TaskPermissions,
 } from "@repo/shared";
@@ -55,7 +56,7 @@ describe("getTaskPermissions", () => {
 				canPause: false,
 				pauseDisabled: false,
 				canResume: true,
-				canSendMessage: true,
+				canSendMessage: false,
 			},
 		},
 		{
@@ -153,7 +154,7 @@ describe("isStableTask", () => {
 		{
 			name: "complete state",
 			overrides: { current_state: state("complete") },
-			expected: true,
+			expected: false,
 		},
 		{
 			name: "failed state",
@@ -235,5 +236,16 @@ describe("isAgentStarting", () => {
 				task({ workspace_status: ws, workspace_agent_lifecycle: lc }),
 			),
 		).toBe(expected);
+	});
+});
+
+describe("logPreviewLabel", () => {
+	it.each([
+		{ count: 0, expected: "AI chat messages" },
+		{ count: 1, expected: "Last message of AI chat" },
+		{ count: 5, expected: "Last 5 messages of AI chat" },
+		{ count: 100, expected: "Last 100 messages of AI chat" },
+	])("count=$count → $expected", ({ count, expected }) => {
+		expect(logPreviewLabel(count)).toBe(expected);
 	});
 });

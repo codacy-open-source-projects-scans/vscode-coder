@@ -3,19 +3,18 @@ import stripAnsi from "strip-ansi";
 import * as vscode from "vscode";
 
 import {
-	commandHandler,
+	buildCommandHandlers,
+	buildRequestHandlers,
 	isBuildingWorkspace,
 	isAgentStarting,
 	getTaskPermissions,
 	getTaskLabel,
 	isStableTask,
-	requestHandler,
 	TasksApi,
 	type CreateTaskParams,
-	type InitResponse,
-	type IpcNotification,
 	type IpcRequest,
 	type IpcResponse,
+	type NotificationDef,
 	type TaskDetails,
 	type TaskLogs,
 	type TaskTemplate,
@@ -74,7 +73,7 @@ function isIpcCommand(
 	);
 }
 
-export class TasksPanel
+export class TasksPanelProvider
 	implements vscode.WebviewViewProvider, vscode.Disposable
 {
 	public static readonly viewType = "coder.tasksPanel";
@@ -89,16 +88,12 @@ export class TasksPanel
 
 	private view?: vscode.WebviewView;
 	private disposables: vscode.Disposable[] = [];
+	private useLegacyPauseResume = false;
 
 	// Workspace log streaming
 	private readonly buildLogStream = new LazyStream<ProvisionerJobLog>();
 	private readonly agentLogStream = new LazyStream<WorkspaceAgentLog[]>();
 	private streamingTaskId: string | null = null;
-
-	// Template cache with TTL
-	private templatesCache: TaskTemplate[] = [];
-	private templatesCacheTime = 0;
-	private readonly CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 	// Cache logs for last viewed task in stable state
 	private cachedLogs?: {
@@ -106,75 +101,28 @@ export class TasksPanel
 		logs: TaskLogs;
 	};
 
-	/**
-	 * Request handlers indexed by method name.
-	 * Type safety is ensured at definition time via requestHandler().
-	 */
-	private readonly requestHandlers: Record<
-		string,
-		(params: unknown) => Promise<unknown>
-	> = {
-		[TasksApi.init.method]: requestHandler(TasksApi.init, () =>
-			this.handleInit(),
-		),
-		[TasksApi.getTasks.method]: requestHandler(TasksApi.getTasks, async () => {
-			const result = await this.fetchTasksWithStatus();
-			return result.tasks;
-		}),
-		[TasksApi.getTemplates.method]: requestHandler(TasksApi.getTemplates, () =>
-			this.fetchTemplates(),
-		),
-		[TasksApi.getTask.method]: requestHandler(TasksApi.getTask, (p) =>
-			this.client.getTask("me", p.taskId),
-		),
-		[TasksApi.getTaskDetails.method]: requestHandler(
-			TasksApi.getTaskDetails,
-			(p) => this.handleGetTaskDetails(p.taskId),
-		),
-		[TasksApi.createTask.method]: requestHandler(TasksApi.createTask, (p) =>
-			this.handleCreateTask(p),
-		),
-		[TasksApi.deleteTask.method]: requestHandler(TasksApi.deleteTask, (p) =>
-			this.handleDeleteTask(p.taskId, p.taskName),
-		),
-		[TasksApi.pauseTask.method]: requestHandler(TasksApi.pauseTask, (p) =>
-			this.handlePauseTask(p.taskId, p.taskName),
-		),
-		[TasksApi.resumeTask.method]: requestHandler(TasksApi.resumeTask, (p) =>
-			this.handleResumeTask(p.taskId, p.taskName),
-		),
-		[TasksApi.downloadLogs.method]: requestHandler(TasksApi.downloadLogs, (p) =>
-			this.handleDownloadLogs(p.taskId),
-		),
-		[TasksApi.sendTaskMessage.method]: requestHandler(
-			TasksApi.sendTaskMessage,
-			(p) => this.handleSendMessage(p.taskId, p.message),
-		),
-	};
+	private readonly requestHandlers = buildRequestHandlers(TasksApi, {
+		getTasks: () => this.fetchTasks(),
+		getTemplates: () => this.fetchTemplates(),
+		getTask: (p) => this.client.getTask("me", p.taskId),
+		getTaskDetails: (p) => this.handleGetTaskDetails(p.taskId),
+		createTask: (p) => this.handleCreateTask(p),
+		deleteTask: (p) => this.handleDeleteTask(p.taskId, p.taskName),
+		pauseTask: (p) => this.handlePauseTask(p.taskId),
+		resumeTask: (p) => this.handleResumeTask(p.taskId),
+		downloadLogs: (p) => this.handleDownloadLogs(p.taskId),
+		sendTaskMessage: (p) => this.handleSendMessage(p.taskId, p.message),
+	});
 
-	/**
-	 * Command handlers indexed by method name.
-	 * Type safety is ensured at definition time via commandHandler().
-	 */
-	private readonly commandHandlers: Record<
-		string,
-		(params: unknown) => void | Promise<void>
-	> = {
-		[TasksApi.viewInCoder.method]: commandHandler(TasksApi.viewInCoder, (p) =>
-			this.handleViewInCoder(p.taskId),
-		),
-		[TasksApi.viewLogs.method]: commandHandler(TasksApi.viewLogs, (p) =>
-			this.handleViewLogs(p.taskId),
-		),
-		[TasksApi.closeWorkspaceLogs.method]: commandHandler(
-			TasksApi.closeWorkspaceLogs,
-			() => {
-				this.buildLogStream.close();
-				this.agentLogStream.close();
-				this.streamingTaskId = null;
-			},
-		),
-	};
+	private readonly commandHandlers = buildCommandHandlers(TasksApi, {
+		viewInCoder: (p) => this.handleViewInCoder(p.taskId),
+		viewLogs: (p) => this.handleViewLogs(p.taskId),
+		stopStreamingWorkspaceLogs: () => {
+			this.streamingTaskId = null;
+			this.buildLogStream.close();
+			this.agentLogStream.close();
+		},
+	});
 
 	constructor(
 		private readonly extensionUri: vscode.Uri,
@@ -183,13 +131,12 @@ export class TasksPanel
 	) {}
 
 	public showCreateForm(): void {
-		this.sendNotification({ type: TasksApi.showCreateForm.method });
+		this.notify(TasksApi.showCreateForm);
 	}
 
 	public refresh(): void {
-		this.templatesCacheTime = 0;
 		this.cachedLogs = undefined;
-		this.sendNotification({ type: TasksApi.refresh.method });
+		this.notify(TasksApi.refresh);
 	}
 
 	resolveWebviewView(
@@ -261,7 +208,7 @@ export class TasksPanel
 				success: false,
 				error: errorMessage,
 			});
-			if (TasksPanel.USER_ACTION_METHODS.has(method)) {
+			if (TasksPanelProvider.USER_ACTION_METHODS.has(method)) {
 				vscode.window.showErrorMessage(errorMessage);
 			}
 		}
@@ -282,21 +229,8 @@ export class TasksPanel
 		} catch (err) {
 			const errorMessage = toError(err).message;
 			this.logger.warn(`Command ${method} failed`, err);
-			vscode.window.showErrorMessage(`Command failed: ${errorMessage}`);
+			vscode.window.showErrorMessage(errorMessage);
 		}
-	}
-
-	private async handleInit(): Promise<InitResponse> {
-		const [tasksResult, templates] = await Promise.all([
-			this.fetchTasksWithStatus(),
-			this.fetchTemplates(),
-		]);
-		return {
-			tasks: tasksResult.tasks,
-			templates,
-			baseUrl: this.client.getHost() ?? "",
-			tasksSupported: tasksResult.supported,
-		};
 	}
 
 	private async handleGetTaskDetails(taskId: string): Promise<TaskDetails> {
@@ -317,7 +251,7 @@ export class TasksPanel
 
 		await this.refreshAndNotifyTasks();
 		vscode.window.showInformationMessage(
-			`Task "${getTaskLabel(task)}" created successfully`,
+			`Task "${getTaskLabel(task)}" created`,
 		);
 		return task;
 	}
@@ -327,12 +261,12 @@ export class TasksPanel
 		taskName: string,
 	): Promise<void> {
 		const confirmed = await vscodeProposed.window.showWarningMessage(
-			`Delete task "${taskName}"`,
+			`Delete task "${taskName}"?`,
 			{
 				modal: true,
 				useCustom: true,
 				detail:
-					"This action is irreversible and removes all workspace resources and data.",
+					"This will permanently delete the workspace and all associated data.",
 			},
 			"Delete",
 		);
@@ -347,42 +281,58 @@ export class TasksPanel
 		}
 
 		await this.refreshAndNotifyTasks();
-		vscode.window.showInformationMessage(
-			`Task "${taskName}" deleted successfully`,
+		vscode.window.showInformationMessage(`Task "${taskName}" deleted`);
+	}
+
+	private handlePauseTask(taskId: string): Promise<void> {
+		return this.pauseOrResumeTask(
+			taskId,
+			() => this.client.pauseTask("me", taskId),
+			(workspaceId) => this.client.stopWorkspace(workspaceId),
 		);
 	}
 
-	private async handlePauseTask(
-		taskId: string,
-		taskName: string,
-	): Promise<void> {
-		const task = await this.client.getTask("me", taskId);
-		if (!task.workspace_id) {
-			throw new Error("Task has no workspace");
-		}
-
-		await this.client.stopWorkspace(task.workspace_id);
-
-		await this.refreshAndNotifyTask(taskId);
-		vscode.window.showInformationMessage(`Task "${taskName}" paused`);
+	private handleResumeTask(taskId: string): Promise<void> {
+		return this.pauseOrResumeTask(
+			taskId,
+			() => this.client.resumeTask("me", taskId),
+			(workspaceId, task) =>
+				this.client.startWorkspace(workspaceId, task.template_version_id),
+		);
 	}
 
-	private async handleResumeTask(
+	private async pauseOrResumeTask(
 		taskId: string,
-		taskName: string,
+		taskApiCall: () => Promise<unknown>,
+		legacyCall: (workspaceId: string, task: Task) => Promise<unknown>,
 	): Promise<void> {
-		const task = await this.client.getTask("me", taskId);
-		if (!task.workspace_id) {
-			throw new Error("Task has no workspace");
+		if (this.useLegacyPauseResume) {
+			return this.legacyPauseOrResume(taskId, legacyCall);
 		}
 
-		await this.client.startWorkspace(
-			task.workspace_id,
-			task.template_version_id,
-		);
+		try {
+			await taskApiCall();
+			await this.refreshAndNotifyTask(taskId);
+		} catch (err) {
+			if (isAxiosError(err) && err.response?.status === 404) {
+				this.useLegacyPauseResume = true;
+				return this.legacyPauseOrResume(taskId, legacyCall);
+			}
+			throw err;
+		}
+	}
 
+	private async legacyPauseOrResume(
+		taskId: string,
+		legacyCall: (workspaceId: string, task: Task) => Promise<unknown>,
+	): Promise<void> {
+		const task = await this.client.getTask("me", taskId);
+		const { workspace_id } = task;
+		if (!workspace_id) {
+			throw new Error("Task has no workspace yet");
+		}
+		await legacyCall(workspace_id, task);
 		await this.refreshAndNotifyTask(taskId);
-		vscode.window.showInformationMessage(`Task "${taskName}" resumed`);
 	}
 
 	private async handleSendMessage(
@@ -392,13 +342,7 @@ export class TasksPanel
 		const task = await this.client.getTask("me", taskId);
 
 		if (task.status === "paused") {
-			if (!task.workspace_id) {
-				throw new Error("Task has no workspace");
-			}
-			await this.client.startWorkspace(
-				task.workspace_id,
-				task.template_version_id,
-			);
+			throw new Error("Resume the task before sending a message");
 		}
 
 		try {
@@ -408,17 +352,14 @@ export class TasksPanel
 				isAxiosError(err) &&
 				(err.response?.status === 409 || err.response?.status === 400)
 			) {
-				throw new Error(
-					`Task is not ready to receive messages (${errToStr(err)})`,
-				);
+				throw new Error(`Agent is not ready for messages (${errToStr(err)})`, {
+					cause: err,
+				});
 			}
 			throw err;
 		}
 
 		await this.refreshAndNotifyTask(taskId);
-		vscode.window.showInformationMessage(
-			`Message sent to "${getTaskLabel(task)}"`,
-		);
 	}
 
 	private async handleViewInCoder(taskId: string): Promise<void> {
@@ -442,7 +383,7 @@ export class TasksPanel
 	private async handleDownloadLogs(taskId: string): Promise<void> {
 		const result = await this.fetchTaskLogs(taskId);
 		if (result.status !== "ok") {
-			throw new Error("Failed to fetch logs for download");
+			throw new Error("Unable to download logs");
 		}
 		if (result.logs.length === 0) {
 			vscode.window.showWarningMessage("No logs available to download");
@@ -473,36 +414,48 @@ export class TasksPanel
 
 	private async streamWorkspaceLogs(task: Task): Promise<void> {
 		if (task.id !== this.streamingTaskId) {
+			this.streamingTaskId = task.id;
 			this.buildLogStream.close();
 			this.agentLogStream.close();
-			this.streamingTaskId = task.id;
 		}
 
 		const onOutput = (line: string) => {
 			const clean = stripAnsi(line);
 			// Skip lines that were purely ANSI codes, but keep intentional blank lines.
 			if (line.length > 0 && clean.length === 0) return;
-			this.sendNotification({
-				type: TasksApi.workspaceLogsAppend.method,
-				data: [clean],
+			this.notify(TasksApi.workspaceLogsAppend, [clean]);
+		};
+
+		const onStreamClose = () => {
+			if (this.streamingTaskId !== task.id) return;
+			this.refreshAndNotifyTask(task.id).catch((err: unknown) => {
+				this.logger.warn("Failed to refresh task after stream close", err);
 			});
 		};
 
 		if (isBuildingWorkspace(task) && task.workspace_id) {
 			this.agentLogStream.close();
 			const workspace = await this.client.getWorkspace(task.workspace_id);
-			await this.buildLogStream.open(() =>
-				streamBuildLogs(this.client, onOutput, workspace.latest_build.id),
-			);
+			await this.buildLogStream.open(async () => {
+				const stream = await streamBuildLogs(
+					this.client,
+					onOutput,
+					workspace.latest_build.id,
+				);
+				stream.addEventListener("close", onStreamClose);
+				return stream;
+			});
 			return;
 		}
 
 		if (isAgentStarting(task) && task.workspace_agent_id) {
 			const agentId = task.workspace_agent_id;
 			this.buildLogStream.close();
-			await this.agentLogStream.open(() =>
-				streamAgentLogs(this.client, onOutput, agentId),
-			);
+			await this.agentLogStream.open(async () => {
+				const stream = await streamAgentLogs(this.client, onOutput, agentId);
+				stream.addEventListener("close", onStreamClose);
+				return stream;
+			});
 			return;
 		}
 
@@ -510,20 +463,16 @@ export class TasksPanel
 		this.agentLogStream.close();
 	}
 
-	private async fetchTasksWithStatus(): Promise<{
-		tasks: readonly Task[];
-		supported: boolean;
-	}> {
+	private async fetchTasks(): Promise<readonly Task[] | null> {
 		if (!this.client.getHost()) {
-			return { tasks: [], supported: true };
+			return [];
 		}
 
 		try {
-			const tasks = await this.client.getTasks({ owner: "me" });
-			return { tasks, supported: true };
+			return await this.client.getTasks({ owner: "me" });
 		} catch (err) {
 			if (isAxiosError(err) && err.response?.status === 404) {
-				return { tasks: [], supported: false };
+				return null;
 			}
 			throw err;
 		}
@@ -531,11 +480,10 @@ export class TasksPanel
 
 	private async refreshAndNotifyTasks(): Promise<void> {
 		try {
-			const tasks = await this.fetchTasksWithStatus();
-			this.sendNotification({
-				type: TasksApi.tasksUpdated.method,
-				data: tasks.tasks,
-			});
+			const tasks = await this.fetchTasks();
+			if (tasks !== null) {
+				this.notify(TasksApi.tasksUpdated, tasks);
+			}
 		} catch (err) {
 			this.logger.warn("Failed to refresh tasks after action", err);
 		}
@@ -544,60 +492,54 @@ export class TasksPanel
 	private async refreshAndNotifyTask(taskId: string): Promise<void> {
 		try {
 			const task = await this.client.getTask("me", taskId);
-			this.sendNotification({
-				type: TasksApi.taskUpdated.method,
-				data: task,
-			});
+			this.notify(TasksApi.taskUpdated, task);
 		} catch (err) {
 			this.logger.warn("Failed to refresh task after action", err);
 		}
 	}
 
-	private async fetchTemplates(): Promise<TaskTemplate[]> {
+	private async fetchTemplates(): Promise<TaskTemplate[] | null> {
 		if (!this.client.getHost()) {
 			return [];
 		}
 
-		const now = Date.now();
-		if (
-			this.templatesCache.length > 0 &&
-			now - this.templatesCacheTime < this.CACHE_TTL_MS
-		) {
-			return this.templatesCache;
+		try {
+			const templates = await this.client.getTemplates({
+				q: "has-ai-task:true",
+			});
+
+			return await Promise.all(
+				templates.map(async (template: Template): Promise<TaskTemplate> => {
+					let presets: Preset[] = [];
+					try {
+						presets =
+							(await this.client.getTemplateVersionPresets(
+								template.active_version_id,
+							)) ?? [];
+					} catch {
+						// Presets may not be available
+					}
+
+					return {
+						id: template.id,
+						name: template.display_name || template.name,
+						description: template.description,
+						activeVersionId: template.active_version_id,
+						presets: presets.map((p) => ({
+							id: p.ID,
+							name: p.Name,
+							description: p.Description,
+							isDefault: p.Default,
+						})),
+					};
+				}),
+			);
+		} catch (err) {
+			if (isAxiosError(err) && err.response?.status === 404) {
+				return null;
+			}
+			throw err;
 		}
-
-		const templates = await this.client.getTemplates({});
-
-		const result = await Promise.all(
-			templates.map(async (template: Template): Promise<TaskTemplate> => {
-				let presets: Preset[] = [];
-				try {
-					presets =
-						(await this.client.getTemplateVersionPresets(
-							template.active_version_id,
-						)) ?? [];
-				} catch {
-					// Presets may not be available
-				}
-
-				return {
-					id: template.id,
-					name: template.name,
-					displayName: template.display_name || template.name,
-					icon: template.icon,
-					activeVersionId: template.active_version_id,
-					presets: presets.map((p) => ({
-						id: p.ID,
-						name: p.Name,
-						isDefault: p.Default,
-					})),
-				};
-			}),
-		);
-
-		this.templatesCache = result;
-		this.templatesCacheTime = now;
-		return result;
 	}
 
 	/**
@@ -624,7 +566,12 @@ export class TasksPanel
 	private async fetchTaskLogs(taskId: string): Promise<TaskLogs> {
 		try {
 			const response = await this.client.getTaskLogs("me", taskId);
-			return { status: "ok", logs: response.logs };
+			return {
+				status: "ok",
+				logs: response.logs,
+				snapshot: response.snapshot,
+				snapshotAt: response.snapshot_at,
+			};
 		} catch (err) {
 			if (isAxiosError(err) && err.response?.status === 409) {
 				return { status: "not_available" };
@@ -638,8 +585,14 @@ export class TasksPanel
 		this.view?.webview.postMessage(response);
 	}
 
-	private sendNotification(notification: IpcNotification): void {
-		this.view?.webview.postMessage(notification);
+	private notify<D>(
+		def: NotificationDef<D>,
+		...args: D extends void ? [] : [data: D]
+	): void {
+		this.view?.webview.postMessage({
+			type: def.method,
+			...(args.length > 0 ? { data: args[0] } : {}),
+		});
 	}
 
 	dispose(): void {

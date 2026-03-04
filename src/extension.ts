@@ -19,7 +19,7 @@ import { Remote } from "./remote/remote";
 import { getRemoteSshExtension } from "./remote/sshExtension";
 import { registerUriHandler } from "./uri/uriHandler";
 import { initVscodeProposed } from "./vscodeProposed";
-import { TasksPanel } from "./webviews/tasks/tasksPanel";
+import { TasksPanelProvider } from "./webviews/tasks/tasksPanelProvider";
 import {
 	WorkspaceProvider,
 	WorkspaceQuery,
@@ -65,22 +65,6 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 	const mementoManager = serviceContainer.getMementoManager();
 	const secretsManager = serviceContainer.getSecretsManager();
 	const contextManager = serviceContainer.getContextManager();
-
-	const syncTasksFlag = () => {
-		const enabled =
-			vscode.workspace
-				.getConfiguration()
-				.get<boolean>("coder.experimental.tasks") === true;
-		contextManager.set("coder.tasksEnabled", enabled);
-	};
-	syncTasksFlag();
-	ctx.subscriptions.push(
-		vscode.workspace.onDidChangeConfiguration((e) => {
-			if (e.affectsConfiguration("coder.experimental.tasks")) {
-				syncTasksFlag();
-			}
-		}),
-	);
 
 	// Migrate auth storage from old flat format to new label-based format
 	await migrateAuthStorage(serviceContainer);
@@ -205,15 +189,25 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 	const commands = new Commands(serviceContainer, client, deploymentManager);
 
 	// Register Tasks webview panel with dependencies
-	const tasksPanel = new TasksPanel(ctx.extensionUri, client, output);
+	const tasksPanelProvider = new TasksPanelProvider(
+		ctx.extensionUri,
+		client,
+		output,
+	);
 	ctx.subscriptions.push(
-		tasksPanel,
-		vscode.window.registerWebviewViewProvider(TasksPanel.viewType, tasksPanel),
+		tasksPanelProvider,
+		vscode.window.registerWebviewViewProvider(
+			TasksPanelProvider.viewType,
+			tasksPanelProvider,
+			{ webviewOptions: { retainContextWhenHidden: true } },
+		),
 		vscode.commands.registerCommand("coder.tasks.refresh", () =>
-			tasksPanel.refresh(),
+			tasksPanelProvider.refresh(),
 		),
 		// Refresh tasks panel when deployment changes (login/logout/switch)
-		secretsManager.onDidChangeCurrentDeployment(() => tasksPanel.refresh()),
+		secretsManager.onDidChangeCurrentDeployment(() =>
+			tasksPanelProvider.refresh(),
+		),
 	);
 
 	ctx.subscriptions.push(

@@ -16,7 +16,7 @@ vi.mock("@repo/tasks/hooks/useTasksApi", () => ({
 const WORKSPACE_LOG_LINE = "mock workspace log line";
 
 vi.mock("@repo/tasks/hooks/useWorkspaceLogs", () => ({
-	useWorkspaceLogs: () => [WORKSPACE_LOG_LINE],
+	useWorkspaceLogs: () => [{ id: 0, text: WORKSPACE_LOG_LINE }],
 }));
 
 describe("TaskDetailView", () => {
@@ -118,14 +118,14 @@ describe("TaskDetailView", () => {
 		renderWithQuery(<TaskDetailView details={details} onBack={() => {}} />);
 		expect(screen.getByRole("textbox")).toHaveAttribute(
 			"placeholder",
-			"Send a message to resume the task...",
+			"Resume the task to send messages",
 		);
 	});
 
 	it("shows logsStatus error in chat history", () => {
 		const details = taskDetails({ logs: { status: "error" } });
 		renderWithQuery(<TaskDetailView details={details} onBack={() => {}} />);
-		expect(screen.getByText("Failed to load logs")).toBeInTheDocument();
+		expect(screen.getByText("Failed to load messages")).toBeInTheDocument();
 	});
 
 	describe("workspace startup rendering", () => {

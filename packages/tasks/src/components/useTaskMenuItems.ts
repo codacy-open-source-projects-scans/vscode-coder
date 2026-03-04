@@ -73,20 +73,21 @@ export function useTaskMenuItems({
 	menuItems.push({
 		label: "View in Coder",
 		icon: "link-external",
-		onClick: () => api.viewInCoder(task.id),
+		onClick: () => api.viewInCoder({ taskId: task.id }),
 	});
 
 	menuItems.push({
 		label: "Download Logs",
 		icon: "cloud-download",
-		onClick: () => run("downloading", () => api.downloadLogs(task.id)),
+		onClick: () =>
+			run("downloading", () => api.downloadLogs({ taskId: task.id })),
 		loading: action === "downloading",
 	});
 
 	menuItems.push({ separator: true });
 
 	menuItems.push({
-		label: "Delete",
+		label: "Delete Task",
 		icon: "trash",
 		onClick: () =>
 			run("deleting", () => api.deleteTask({ taskId: task.id, taskName })),

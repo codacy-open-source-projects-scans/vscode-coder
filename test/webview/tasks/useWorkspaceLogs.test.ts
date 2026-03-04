@@ -57,19 +57,26 @@ describe("useWorkspaceLogs", () => {
 		const h = renderLogs();
 
 		h.notify(["line 1", "line 2"]);
-		expect(h.lines).toEqual(["line 1", "line 2"]);
+		expect(h.lines).toEqual([
+			{ id: 0, text: "line 1" },
+			{ id: 1, text: "line 2" },
+		]);
 
 		h.notify(["line 3"]);
-		expect(h.lines).toEqual(["line 1", "line 2", "line 3"]);
+		expect(h.lines).toEqual([
+			{ id: 0, text: "line 1" },
+			{ id: 1, text: "line 2" },
+			{ id: 2, text: "line 3" },
+		]);
 	});
 
-	it("sends closeWorkspaceLogs on unmount", () => {
+	it("sends stopStreamingWorkspaceLogs on unmount", () => {
 		const h = renderLogs();
 		const sent = h.unmount();
 
 		expect(sent).toContainEqual(
 			expect.objectContaining({
-				method: TasksApi.closeWorkspaceLogs.method,
+				method: TasksApi.stopStreamingWorkspaceLogs.method,
 			}),
 		);
 	});
