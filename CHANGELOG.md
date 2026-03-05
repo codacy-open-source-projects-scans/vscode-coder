@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## [v1.13.1](https://github.com/coder/vscode-coder/releases/tag/v1.13.1) 2026-03-04
+
+### Added
+
+- Session tokens are now stored in the OS keyring (Keychain on macOS, Credential Manager on
+  Windows) instead of plaintext files, when using CLI >= 2.29.0. Falls back to file storage on
+  Linux, older CLIs, or if the keyring write fails. Controlled via the `coder.useKeyring` setting.
+
+### Fixed
+
+- Fixed CLI binary downloads failing when servers or proxies compress responses unexpectedly.
+- Clarified CLI download progress notification wording.
+
 ## [v1.13.0](https://github.com/coder/vscode-coder/releases/tag/v1.13.0) 2026-03-03
 
 ### Added
