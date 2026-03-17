@@ -1,7 +1,7 @@
 {
 	"name": "coder-remote",
 	"displayName": "Coder",
-	"version": "1.14.0",
+	"version": "1.14.1",
 	"description": "Open any workspace with a single click.",
 	"categories": [
 		"Other"
@@ -157,9 +157,9 @@
 					}
 				},
 				"coder.useKeyring": {
-					"markdownDescription": "Store session tokens in the OS keyring (macOS Keychain, Windows Credential Manager) instead of plaintext files. Requires CLI >= 2.29.0. Has no effect on Linux.",
+					"markdownDescription": "Store session tokens in the OS keyring (macOS Keychain, Windows Credential Manager) instead of plaintext files. Requires CLI >= 2.29.0 (>= 2.31.0 to sync login from CLI to VS Code). This will attempt to sync between the CLI and VS Code since they share the same keyring entry. It will log you out of the CLI if you log out of the IDE, and vice versa. Has no effect on Linux.",
 					"type": "boolean",
-					"default": true
+					"default": false
 				},
 				"coder.httpClientLogLevel": {
 					"markdownDescription": "Controls the verbosity of HTTP client logging. This affects what details are logged for each HTTP request and response.",
@@ -212,6 +212,12 @@
 			],
 			"coderTasks": [
 				{
+					"id": "coder.tasksLogin",
+					"name": "Coder Tasks",
+					"icon": "media/tasks-logo.svg",
+					"when": "!coder.authenticated"
+				},
+				{
 					"type": "webview",
 					"id": "coder.tasksPanel",
 					"name": "Coder Tasks",
@@ -224,6 +230,11 @@
 			{
 				"view": "myWorkspaces",
 				"contents": "Coder is a platform that provisions remote development environments. \n[Login](command:coder.login)",
+				"when": "!coder.authenticated && coder.loaded"
+			},
+			{
+				"view": "coder.tasksLogin",
+				"contents": "Sign in to view and manage Coder tasks.\n[Login](command:coder.login)",
 				"when": "!coder.authenticated && coder.loaded"
 			}
 		],
@@ -320,6 +331,11 @@
 				"title": "Refresh Tasks",
 				"category": "Coder",
 				"icon": "$(refresh)"
+			},
+			{
+				"command": "coder.applyRecommendedSettings",
+				"title": "Apply Recommended SSH Settings",
+				"category": "Coder"
 			}
 		],
 		"menus": {
@@ -386,6 +402,9 @@
 				{
 					"command": "coder.tasks.refresh",
 					"when": "false"
+				},
+				{
+					"command": "coder.applyRecommendedSettings"
 				}
 			],
 			"view/title": [
