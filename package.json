@@ -121,6 +121,11 @@
 					"type": "boolean",
 					"default": false
 				},
+				"coder.disableNotifications": {
+					"markdownDescription": "Disable all notification prompts from the Coder deployment (workspace updates, scheduling reminders, resource alerts, etc.). Notifications are delivered by your Coder server and displayed by this extension.",
+					"type": "boolean",
+					"default": false
+				},
 				"coder.disableUpdateNotifications": {
 					"markdownDescription": "Disable notifications when workspace template updates are available.",
 					"type": "boolean",
@@ -503,7 +508,8 @@
 		"word-wrap": "1.2.5"
 	},
 	"dependencies": {
-		"@peculiar/x509": "^1.14.3",
+		"@abraham/reflection": "^0.13.0",
+		"@peculiar/x509": "^2.0.0",
 		"@repo/shared": "workspace:*",
 		"axios": "1.13.6",
 		"date-fns": "catalog:",
