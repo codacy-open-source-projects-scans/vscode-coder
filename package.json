@@ -62,7 +62,7 @@
 					"default": ""
 				},
 				"coder.binaryDestination": {
-					"markdownDescription": "The full path of the directory into which the Coder CLI will be downloaded. Defaults to the value of `CODER_BINARY_DESTINATION` if not set, otherwise the extension's global storage directory.",
+					"markdownDescription": "The path to the Coder CLI binary or the directory containing it. When set to a file path (e.g., `/usr/bin/coder`), the extension checks its version and downloads a replacement if it does not match the server (and downloads are enabled). When set to a directory, the extension looks for the CLI inside it (downloading if enabled). Defaults to the value of `CODER_BINARY_DESTINATION` if not set, otherwise the extension's global storage directory.",
 					"type": "string",
 					"default": ""
 				},
@@ -325,6 +325,11 @@
 				"category": "Coder"
 			},
 			{
+				"command": "coder.supportBundle",
+				"title": "Create Support Bundle",
+				"category": "Coder"
+			},
+			{
 				"command": "coder.viewLogs",
 				"title": "Coder: View Logs",
 				"icon": "$(list-unordered)"
@@ -381,6 +386,10 @@
 			{
 				"command": "coder.pingWorkspace:views",
 				"title": "Ping"
+			},
+			{
+				"command": "coder.supportBundle:views",
+				"title": "Support Bundle"
 			}
 		],
 		"menus": {
@@ -406,6 +415,10 @@
 					"when": "coder.authenticated"
 				},
 				{
+					"command": "coder.supportBundle",
+					"when": "coder.authenticated"
+				},
+				{
 					"command": "coder.navigateToWorkspace",
 					"when": "coder.workspace.connected"
 				},
@@ -423,6 +436,10 @@
 				},
 				{
 					"command": "coder.pingWorkspace:views",
+					"when": "false"
+				},
+				{
+					"command": "coder.supportBundle:views",
 					"when": "false"
 				},
 				{
@@ -535,12 +552,17 @@
 				{
 					"command": "coder.pingWorkspace:views",
 					"when": "coder.authenticated && viewItem =~ /\\+running/",
-					"group": "navigation"
+					"group": "navigation@1"
 				},
 				{
 					"command": "coder.speedTest:views",
 					"when": "coder.authenticated && viewItem =~ /\\+running/",
-					"group": "navigation"
+					"group": "navigation@2"
+				},
+				{
+					"command": "coder.supportBundle:views",
+					"when": "coder.authenticated && viewItem =~ /\\+running/",
+					"group": "navigation@3"
 				}
 			],
 			"statusBar/remoteIndicator": [
@@ -565,7 +587,7 @@
 		"@abraham/reflection": "^0.13.0",
 		"@peculiar/x509": "^2.0.0",
 		"@repo/shared": "workspace:*",
-		"axios": "1.13.6",
+		"axios": "1.15.0",
 		"date-fns": "catalog:",
 		"eventsource": "^4.1.0",
 		"find-process": "^2.1.1",
