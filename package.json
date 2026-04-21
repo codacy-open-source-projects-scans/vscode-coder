@@ -1,7 +1,7 @@
 {
 	"name": "coder-remote",
 	"displayName": "Coder",
-	"version": "1.14.3",
+	"version": "1.14.4",
 	"description": "Open any workspace with a single click.",
 	"categories": [
 		"Other"
@@ -166,6 +166,12 @@
 					"markdownDescription": "Store session tokens in the OS keyring (macOS Keychain, Windows Credential Manager) instead of plaintext files. Requires CLI >= 2.29.0 (>= 2.31.0 to sync login from CLI to VS Code). This will attempt to sync between the CLI and VS Code since they share the same keyring entry. It will log you out of the CLI if you log out of the IDE, and vice versa. Has no effect on Linux.",
 					"type": "boolean",
 					"default": false
+				},
+				"coder.networkThreshold.latencyMs": {
+					"markdownDescription": "Latency threshold in milliseconds. A warning indicator appears in the status bar when latency exceeds this value. Set to `0` to disable.",
+					"type": "number",
+					"minimum": 0,
+					"default": 250
 				},
 				"coder.httpClientLogLevel": {
 					"markdownDescription": "Controls the verbosity of HTTP client logging. This affects what details are logged for each HTTP request and response.",
