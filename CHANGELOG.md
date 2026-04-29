@@ -5,6 +5,19 @@
      from published versions since it shows up in the VS Code extension changelog
      tab and is confusing to users. Add it back between releases if needed. -->
 
+## Unreleased
+
+### Added
+
+- Opening a workspace that's already connected in another VS Code window now shows a prompt
+  to **Duplicate Window** (preserving tabs and panels) or **Open Without Folder**, instead of
+  just focusing the existing window with no way to open a second view of the same workspace.
+
+### Fixed
+
+- The **Coder: Workspace Build** output channel is no longer created when reconnecting to an
+  already-running workspace, so the Output panel doesn't pop open empty.
+
 ## [v1.14.4-pre](https://github.com/coder/vscode-coder/releases/tag/v1.14.4-pre) 2026-04-20
 
 ### Added
