@@ -1,21 +1,20 @@
 import * as vscode from "vscode";
 
-import { errToStr } from "../api/api-helper";
-import { CALLBACK_PATH } from "../oauth/utils";
-import { maybeAskUrl } from "../promptUtils";
-import { toSafeHost } from "../util";
-import { vscodeProposed } from "../vscodeProposed";
+import { isSameOrigin, toSafeHost } from "../common/url";
+import { errToStr } from "../error/normalize";
+import { AuthTelemetry } from "../instrumentation/auth";
+import { CALLBACK_PATH } from "../oauth/constants";
+import { maybeAskUrl } from "../ui/prompts";
+import { vscodeProposed } from "../vscode/proposed";
 
 import type { Commands } from "../commands";
-import type { ServiceContainer } from "../core/container";
+import type { ServiceContainer } from "../container";
 import type { DeploymentManager } from "../deployment/deploymentManager";
-import type { ChatPanelProvider } from "../webviews/chat/chatPanelProvider";
 
 interface UriHandlerDeps {
 	serviceContainer: ServiceContainer;
 	deploymentManager: Pick<DeploymentManager, "setDeployment">;
 	commands: Pick<Commands, "open" | "openDevContainer">;
-	chatPanelProvider: Pick<ChatPanelProvider, "openChat">;
 }
 
 interface UriRouteContext extends UriHandlerDeps {
@@ -23,6 +22,10 @@ interface UriRouteContext extends UriHandlerDeps {
 }
 
 type UriRouteHandler = (ctx: UriRouteContext) => Promise<void>;
+type CoderUriRoute = "open" | "openDevContainer";
+
+/** The user cancelled at the trust prompt or during login, which is not a failure. */
+class UserDeclinedError extends Error {}
 
 const routes: Readonly<Record<string, UriRouteHandler>> = {
 	"/open": handleOpen,
@@ -48,8 +51,15 @@ export function registerUriHandler(deps: UriHandlerDeps): vscode.Disposable {
 					params: new URLSearchParams(uri.query),
 				});
 			} catch (error) {
+				if (error instanceof UserDeclinedError) {
+					output.info("URI handling cancelled by the user", summarizeUri(uri));
+					return;
+				}
 				const message = errToStr(error, "No error message was provided");
-				output.warn(`Failed to handle URI ${uri.toString()}: ${message}`);
+				output.warn("Failed to handle URI", {
+					...summarizeUri(uri),
+					error: message,
+				});
 				vscodeProposed.window.showErrorMessage("Failed to handle URI", {
 					detail: message,
 					modal: true,
@@ -68,6 +78,17 @@ function getRequiredParam(params: URLSearchParams, name: string): string {
 	return value;
 }
 
+function summarizeUri(uri: vscode.Uri): Record<string, string | boolean> {
+	const params = new URLSearchParams(uri.query);
+	return {
+		path: uri.path,
+		hasOwner: params.has("owner"),
+		hasWorkspace: params.has("workspace"),
+		hasAgent: params.has("agent"),
+		hasToken: params.has("token"),
+	};
+}
+
 async function handleOpen(ctx: UriRouteContext): Promise<void> {
 	const { params, serviceContainer, deploymentManager, commands } = ctx;
 
@@ -79,41 +100,17 @@ async function handleOpen(ctx: UriRouteContext): Promise<void> {
 		params.has("openRecent") &&
 		(!params.get("openRecent") || params.get("openRecent") === "true");
 
-	// Persist the chat ID before commands.open() triggers
-	// a remote-authority reload that wipes in-memory state.
-	// The extension picks this up after the reload in activate().
-	const chatId = params.get("chatId");
-	const mementoManager = serviceContainer.getMementoManager();
-	if (chatId) {
-		await mementoManager.setPendingChatId(chatId);
-	}
+	await setupDeployment("open", params, serviceContainer, deploymentManager);
 
-	await setupDeployment(params, serviceContainer, deploymentManager);
-
-	let opened = false;
-	try {
-		opened = await commands.open({
-			workspaceOwner: owner,
-			workspaceName: workspace,
-			agentName: agent ?? undefined,
-			folderPath: folder ?? undefined,
-			openRecent,
-			useDefaultDirectory: false,
-		});
-	} finally {
-		// Clear the pending chat ID if commands.open() did not
-		// actually open a window (user cancelled, or it threw).
-		if (!opened && chatId) {
-			await mementoManager.clearPendingChatId();
-		}
-	}
-
-	// Already-open workspace: VS Code refocuses without reloading,
-	// so activate() won't run. openChat is idempotent if both fire.
-	if (opened && chatId) {
-		serviceContainer.getContextManager().set("coder.agentsEnabled", true);
-		ctx.chatPanelProvider.openChat(chatId);
-	}
+	await commands.open({
+		workspaceOwner: owner,
+		workspaceName: workspace,
+		agentName: agent ?? undefined,
+		folderPath: folder ?? undefined,
+		openRecent,
+		source: "uri",
+		useDefaultDirectory: false,
+	});
 }
 
 async function handleOpenDevContainer(ctx: UriRouteContext): Promise<void> {
@@ -133,7 +130,12 @@ async function handleOpenDevContainer(ctx: UriRouteContext): Promise<void> {
 		);
 	}
 
-	await setupDeployment(params, serviceContainer, deploymentManager);
+	await setupDeployment(
+		"openDevContainer",
+		params,
+		serviceContainer,
+		deploymentManager,
+	);
 
 	await commands.openDevContainer(
 		owner,
@@ -147,10 +149,11 @@ async function handleOpenDevContainer(ctx: UriRouteContext): Promise<void> {
 }
 
 /**
- * Sets up deployment from URI parameters. Handles URL prompting, client setup,
- * and token storage. Throws if user cancels URL input or login fails.
+ * Sets up deployment from URI parameters: URL prompting, login, and token storage.
+ * @throws {UserDeclinedError} when the user declines to trust an unknown deployment.
  */
 async function setupDeployment(
+	route: CoderUriRoute,
 	params: URLSearchParams,
 	serviceContainer: ServiceContainer,
 	deploymentManager: Pick<DeploymentManager, "setDeployment">,
@@ -158,6 +161,9 @@ async function setupDeployment(
 	const secretsManager = serviceContainer.getSecretsManager();
 	const mementoManager = serviceContainer.getMementoManager();
 	const loginCoordinator = serviceContainer.getLoginCoordinator();
+	const authTelemetry = new AuthTelemetry(
+		serviceContainer.getTelemetryService(),
+	);
 
 	const currentDeployment = await secretsManager.getCurrentDeployment();
 
@@ -176,15 +182,62 @@ async function setupDeployment(
 	}
 
 	const safeHostname = toSafeHost(url);
-
+	const owner = params.get("owner") ?? "";
+	const workspace = params.get("workspace") ?? "";
 	const token: string | undefined = params.get("token") ?? undefined;
-	const result = await loginCoordinator.ensureLoggedIn({
+
+	// A deployment is known once a login stored a session for the same origin.
+	const existingAuth = await secretsManager.getSessionAuth(safeHostname);
+	const knownDeployment =
+		existingAuth !== undefined && isSameOrigin(existingAuth.url, url);
+
+	// Set once the trust prompt has disclosed the token sign-in and the user
+	// agreed, so the login flow does not ask again.
+	let tokenSignInConfirmed = false;
+	if (!knownDeployment) {
+		const target =
+			owner && workspace ? `workspace "${owner}/${workspace}"` : "a workspace";
+		const signsIn = Boolean(token);
+		const disclosure = signsIn
+			? " It contains a token that will sign you in."
+			: "";
+		const action = await vscodeProposed.window.showWarningMessage(
+			"Open workspace from an unknown Coder deployment?",
+			{
+				useCustom: true,
+				modal: true,
+				detail: `${url}\n\nThis link opens ${target} on a deployment you have not logged in to before.${disclosure} If you continue, the deployment can modify your SSH configuration.`,
+			},
+			"Trust and Continue",
+		);
+		if (action !== "Trust and Continue") {
+			throw new UserDeclinedError(
+				"User declined to connect to an unknown deployment",
+			);
+		}
+		tokenSignInConfirmed = signsIn;
+	}
+
+	serviceContainer.getLogger().info("Handling Coder URI", {
+		route,
 		safeHostname,
-		url,
-		token,
+		workspace: owner && workspace ? `${owner}/${workspace}` : "",
+		agent: params.get("agent") ?? "(unspecified)",
 	});
 
+	const result = await authTelemetry.traceLogin("uri", () =>
+		loginCoordinator.ensureLoggedIn({
+			safeHostname,
+			url,
+			token,
+			tokenSignInConfirmed,
+		}),
+	);
+
 	if (!result.success) {
+		if (result.reason === "user_dismissed") {
+			throw new UserDeclinedError("User dismissed the login flow");
+		}
 		throw new Error("Failed to login to deployment from URI");
 	}
 

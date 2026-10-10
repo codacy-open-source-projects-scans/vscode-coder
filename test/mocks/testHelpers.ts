@@ -5,23 +5,81 @@ import axios, {
 	type AxiosResponse,
 	type InternalAxiosRequestConfig,
 } from "axios";
-import { vi } from "vitest";
+import * as fs from "node:fs/promises";
+import { onTestFinished, vi } from "vitest";
 import * as vscode from "vscode";
 
-import type { Experiment, User } from "coder/site/src/api/typesGenerated";
+import {
+	SessionStore,
+	type SessionData,
+	type SignedInSession,
+} from "@/deployment/sessionStore";
+
+import {
+	resource as createResource,
+	workspace as createWorkspace,
+} from "@repo/mocks";
+
+import { createTestTelemetryService } from "./telemetry";
+import { env as vscodeEnv, window as vscodeWindow } from "./vscode.runtime";
+
+import type {
+	Experiment,
+	User,
+	Workspace,
+	WorkspaceAgent,
+	WorkspaceBuild,
+	WorkspaceStatus,
+} from "coder/site/src/api/typesGenerated";
 import type { WebSocketEventType } from "coder/site/src/utils/OneWayWebSocket";
 import type { IncomingMessage } from "node:http";
 
+import type { AgentMetadataEvent } from "@/api/agentMetadata";
 import type { CoderApi } from "@/api/coderApi";
-import type { CliCredentialManager } from "@/core/cliCredentialManager";
+import type { CliCredentialManager } from "@/cli/cliCredentialManager";
+import type { CliManager } from "@/cli/cliManager";
+import type { ServiceContainer } from "@/container";
+import type { Deployment } from "@/deployment/types";
 import type { Logger } from "@/logging/logger";
+import type { LoginCoordinator } from "@/login/loginCoordinator";
 import type { NetworkInfo } from "@/remote/sshProcess";
+import type { MementoManager } from "@/storage/mementoManager";
+import type { PathResolver } from "@/storage/pathResolver";
+import type { SecretsManager } from "@/storage/secretsManager";
+import type { TelemetryService } from "@/telemetry/service";
+import type { ContextManager } from "@/vscode/contextManager";
 import type {
 	EventHandler,
 	EventPayloadMap,
 	ParsedMessageEvent,
 	UnidirectionalStream,
 } from "@/websocket/eventStreamConnection";
+/**
+ * Subset of `ContextManager`'s public API that mocks (e.g. `MockContextManager`)
+ * implement. Used by `createMockServiceContainer` so tests can pass either the
+ * real class or a mock without resorting to `unknown`.
+ */
+interface ContextManagerLike {
+	set(key: string, value: boolean): void;
+	get(key: string): boolean;
+	dispose(): void;
+}
+
+interface LoginCoordinatorLike {
+	ensureLoggedInWithDialog: LoginCoordinator["ensureLoggedInWithDialog"];
+}
+
+/**
+ * Run the rest of the test as the given editor, which is the identity
+ * `vscode.env.uriScheme` reports and the extension names its SSH hosts after.
+ * The previous editor is restored when the test ends.
+ */
+export function useEditor(uriScheme: string): void {
+	const previous = vscodeEnv.__setUriScheme(uriScheme);
+	onTestFinished(() => {
+		vscodeEnv.__setUriScheme(previous);
+	});
+}
 
 export function makeNetworkInfo(
 	overrides: Partial<NetworkInfo> = {},
@@ -44,6 +102,7 @@ export function makeNetworkInfo(
  */
 export class MockConfigurationProvider {
 	private readonly config = new Map<string, unknown>();
+	private readonly defaults = new Map<string, unknown>();
 
 	constructor() {
 		this.setupVSCodeMock();
@@ -64,8 +123,22 @@ export class MockConfigurationProvider {
 	get<T>(key: string): T | undefined;
 	get<T>(key: string, defaultValue: T): T;
 	get<T>(key: string, defaultValue?: T): T | undefined {
-		const value = this.config.get(key);
+		const value = this.config.has(key)
+			? this.config.get(key)
+			: this.defaults.get(key);
 		return value === undefined ? defaultValue : (value as T);
+	}
+
+	setDefault(key: string, value: unknown): void {
+		this.defaults.set(key, value);
+	}
+
+	inspect<T>(key: string) {
+		return {
+			key,
+			defaultValue: this.defaults.get(key) as T | undefined,
+			globalValue: (this.config.get(key) ?? undefined) as T | undefined,
+		};
 	}
 
 	/**
@@ -73,6 +146,7 @@ export class MockConfigurationProvider {
 	 */
 	clear(): void {
 		this.config.clear();
+		this.defaults.clear();
 	}
 
 	/**
@@ -100,18 +174,28 @@ export class MockConfigurationProvider {
 			(section?: string) => {
 				// Create a snapshot of the current config when getConfiguration is called
 				const snapshot = new Map(this.config);
+				const defaults = new Map(this.defaults);
 				const getFullKey = (part: string) =>
 					section ? `${section}.${part}` : part;
 
 				return {
 					get: vi.fn((key: string, defaultValue?: unknown) => {
-						const value = snapshot.get(getFullKey(key));
+						const fullKey = getFullKey(key);
+						const value = snapshot.has(fullKey)
+							? snapshot.get(fullKey)
+							: defaults.get(fullKey);
 						return value === undefined ? defaultValue : value;
 					}),
 					has: vi.fn((key: string) => {
 						return snapshot.has(getFullKey(key));
 					}),
-					inspect: vi.fn(),
+					inspect: <T>(key: string) => ({
+						key: getFullKey(key),
+						defaultValue: defaults.get(getFullKey(key)) as T | undefined,
+						globalValue: (snapshot.get(getFullKey(key)) ?? undefined) as
+							| T
+							| undefined,
+					}),
 					update: vi.fn((key: string, value: unknown) => {
 						this.set(getFullKey(key), value);
 						return Promise.resolve();
@@ -120,6 +204,25 @@ export class MockConfigurationProvider {
 			},
 		);
 	}
+}
+
+export type Settings = Record<string, unknown>;
+
+/** Proxy URL for proxy-config tests. */
+export const PROXY_URL = "http://proxy.example.com:8080";
+
+/** A MockConfigurationProvider seeded with the given settings. */
+export function config(settings: Settings = {}): MockConfigurationProvider {
+	const cfg = new MockConfigurationProvider();
+	for (const [key, value] of Object.entries(settings)) {
+		cfg.set(key, value);
+	}
+	return cfg;
+}
+
+/** Settings with http.proxy set. */
+export function withProxy(settings: Settings = {}): Settings {
+	return { "http.proxy": PROXY_URL, ...settings };
 }
 
 /**
@@ -194,6 +297,7 @@ export interface MessageCall {
 	level: "information" | "warning" | "error";
 	message: string;
 	items: string[];
+	options?: vscode.MessageOptions;
 }
 
 /**
@@ -202,6 +306,7 @@ export interface MessageCall {
  */
 export class MockUserInteraction {
 	private readonly responses = new Map<string, string | undefined>();
+	private readonly patternResponses: Array<[RegExp, string | undefined]> = [];
 	private readonly _messageCalls: MessageCall[] = [];
 	private inputBoxValue: string | undefined;
 	private inputBoxValidateInput: ((value: string) => Promise<void>) | undefined;
@@ -212,10 +317,14 @@ export class MockUserInteraction {
 	}
 
 	/**
-	 * Set a response for a specific message dialog
+	 * Set a response for a message dialog, matched exactly or by pattern.
 	 */
-	setResponse(message: string, response: string | undefined): void {
-		this.responses.set(message, response);
+	setResponse(message: string | RegExp, response: string | undefined): void {
+		if (typeof message === "string") {
+			this.responses.set(message, response);
+		} else {
+			this.patternResponses.push([message, response]);
+		}
 	}
 
 	/**
@@ -260,6 +369,7 @@ export class MockUserInteraction {
 	 */
 	clear(): void {
 		this.responses.clear();
+		this.patternResponses.length = 0;
 		this._messageCalls.length = 0;
 		this.inputBoxValue = undefined;
 		this.inputBoxValidateInput = undefined;
@@ -271,17 +381,27 @@ export class MockUserInteraction {
 	 */
 	private setupVSCodeMock(): void {
 		const getResponse = (message: string): string | undefined => {
-			return this.responses.get(message);
+			if (this.responses.has(message)) {
+				return this.responses.get(message);
+			}
+			return this.patternResponses.find(([pattern]) =>
+				pattern.test(message),
+			)?.[1];
 		};
 
 		const handleMessage =
 			(level: MessageCall["level"]) =>
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any -- serves all show*Message overloads
+			// oxlint-disable-next-line no-explicit-any -- serves all show*Message overloads
 			(message: string, ...rest: unknown[]): Thenable<any> => {
 				const items = rest.filter(
 					(arg): arg is string => typeof arg === "string",
 				);
-				this._messageCalls.push({ level, message, items });
+				// Options object, as opposed to a MessageItem (which has a title).
+				const options = rest.find(
+					(arg): arg is vscode.MessageOptions =>
+						typeof arg === "object" && arg !== null && !("title" in arg),
+				);
+				this._messageCalls.push({ level, message, items, options });
 				return Promise.resolve(getResponse(message));
 			};
 
@@ -426,7 +546,9 @@ export function createMockCliCredentialManager(): CliCredentialManager {
 	return {
 		storeToken: vi.fn().mockResolvedValue(undefined),
 		readToken: vi.fn().mockResolvedValue(undefined),
-		deleteToken: vi.fn().mockResolvedValue(undefined),
+		deleteToken: vi.fn().mockResolvedValue(true),
+		holdsToken: vi.fn().mockResolvedValue(false),
+		hasCliStore: vi.fn().mockResolvedValue(true),
 	} as unknown as CliCredentialManager;
 }
 
@@ -438,7 +560,317 @@ export function createMockLogger(): Logger {
 		warn: vi.fn(),
 		error: vi.fn(),
 		show: vi.fn(),
+		flush: vi.fn(),
 	};
+}
+
+export interface LogEntry {
+	level: "trace" | "debug" | "info" | "warn" | "error";
+	message: string;
+	args: readonly unknown[];
+}
+
+/**
+ * Logger that records what was logged. Assert on `entries` for exact output,
+ * or search `text` when checking that a secret never reached the log.
+ */
+export class LogCollector implements Logger {
+	readonly entries: LogEntry[] = [];
+
+	/** Every message and argument logged, as one searchable string. */
+	get text(): string {
+		return this.entries
+			.flatMap((entry) => [entry.message, ...entry.args])
+			.map(String)
+			.join("\n");
+	}
+
+	trace(message: string, ...args: unknown[]): void {
+		this.collect("trace", message, args);
+	}
+
+	debug(message: string, ...args: unknown[]): void {
+		this.collect("debug", message, args);
+	}
+
+	info(message: string, ...args: unknown[]): void {
+		this.collect("info", message, args);
+	}
+
+	warn(message: string, ...args: unknown[]): void {
+		this.collect("warn", message, args);
+	}
+
+	error(message: string, ...args: unknown[]): void {
+		this.collect("error", message, args);
+	}
+
+	show(): void {}
+
+	flush(): void {}
+
+	private collect(
+		level: LogEntry["level"],
+		message: string,
+		args: readonly unknown[],
+	): void {
+		this.entries.push({ level, message, args });
+	}
+}
+
+/** Resolve once pending microtasks and the macrotask queue have drained. */
+export async function flush(): Promise<void> {
+	await new Promise((resolve) => setImmediate(resolve));
+}
+
+/**
+ * Drain only the microtask queue. Use instead of flush() under fake timers,
+ * which leave the macrotask queue (setImmediate) untouched.
+ */
+export async function flushPromises(): Promise<void> {
+	await Promise.resolve();
+	await Promise.resolve();
+	await Promise.resolve();
+}
+
+/**
+ * Backdate a file's atime/mtime by `daysAgo` days so tests can exercise the
+ * support-bundle age cutoff without waiting.
+ */
+export async function setAge(filePath: string, daysAgo: number): Promise<void> {
+	const past = new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000);
+	await fs.utimes(filePath, past, past);
+}
+
+/**
+ * Minimal `ServiceContainer` stub for tests. Pass only the services the unit
+ * under test reads; unset services throw on access so a missing dependency
+ * surfaces as a clear error rather than a downstream `undefined` deref.
+ */
+export function createMockServiceContainer(
+	overrides: {
+		telemetry?: TelemetryService;
+		logger?: Logger;
+		secretsManager?: SecretsManager;
+		mementoManager?: MementoManager;
+		cliCredentialManager?: CliCredentialManager;
+		cliManager?: CliManager;
+		pathResolver?: PathResolver;
+		contextManager?: ContextManagerLike;
+		loginCoordinator?: LoginCoordinatorLike;
+	} = {},
+): ServiceContainer {
+	const telemetry = overrides.telemetry ?? createTestTelemetryService();
+	const logger = overrides.logger ?? createMockLogger();
+	const require = <T>(name: string, value: T | undefined): T => {
+		if (value === undefined) {
+			throw new Error(`createMockServiceContainer: '${name}' was not provided`);
+		}
+		return value;
+	};
+	return {
+		getTelemetryService: () => telemetry,
+		getLogger: () => logger,
+		getSecretsManager: () =>
+			require("secretsManager", overrides.secretsManager),
+		getMementoManager: () =>
+			require("mementoManager", overrides.mementoManager),
+		getCliCredentialManager: () =>
+			require("cliCredentialManager", overrides.cliCredentialManager),
+		getCliManager: () => require("cliManager", overrides.cliManager),
+		getPathResolver: () => require("pathResolver", overrides.pathResolver),
+		getContextManager: () =>
+			require("contextManager", overrides.contextManager) as ContextManager,
+		getLoginCoordinator: () =>
+			require("loginCoordinator", overrides.loginCoordinator) as LoginCoordinator,
+	} as ServiceContainer;
+}
+
+/** Recently opened entries on one path; a multi-root file has no folder URI. */
+export function mockRecentlyOpened(
+	authorities: string[],
+	path: string,
+	kind: "folder" | "workspaceFile" = "folder",
+): void {
+	const workspaces = authorities.map((authority) => {
+		const uri = vscode.Uri.from({ scheme: "vscode-remote", authority, path });
+		return kind === "folder"
+			? { folderUri: uri }
+			: { workspace: { id: "workspace-1", configPath: uri } };
+	});
+	vi.mocked(vscode.commands.executeCommand).mockImplementation(
+		(command: string) =>
+			Promise.resolve(
+				command === "_workbench.getRecentlyOpened" ? { workspaces } : undefined,
+			),
+	);
+}
+
+/** The authority a window was handed: a folder by URI, an empty window by option. */
+export function openedAuthority(): string | undefined {
+	const [, handoff] =
+		vi
+			.mocked(vscode.commands.executeCommand)
+			.mock.calls.find(([command]) =>
+				["vscode.openFolder", "vscode.newWindow"].includes(command),
+			) ?? [];
+	return handoff instanceof vscode.Uri
+		? handoff.authority
+		: (handoff as { remoteAuthority?: string } | undefined)?.remoteAuthority;
+}
+
+/** Update the mocked active color theme and fire onDidChangeActiveColorTheme. */
+export function setActiveColorTheme(kind: vscode.ColorThemeKind): void {
+	vscodeWindow.__setActiveColorThemeKind(kind);
+}
+
+/** A Webview that records what the extension posts to it. */
+function createMockWebview(options: vscode.WebviewOptions) {
+	const messageEmitter = new vscode.EventEmitter<unknown>();
+	const postedMessages: unknown[] = [];
+	const webview: vscode.Webview = {
+		options,
+		html: "",
+		cspSource: "mock-csp",
+		onDidReceiveMessage: messageEmitter.event,
+		postMessage: (msg: unknown) => {
+			postedMessages.push(msg);
+			return Promise.resolve(true);
+		},
+		asWebviewUri: (uri: vscode.Uri) => uri,
+	};
+	return { webview, messageEmitter, postedMessages };
+}
+
+/** Hooks to drive lifecycle and inspect messages on a mocked WebviewPanel. */
+export interface WebviewPanelTestHooks {
+	setVisible(visible: boolean): void;
+	fireDispose(): void;
+	sendFromWebview(msg: unknown): void;
+	readonly postedMessages: readonly unknown[];
+}
+
+/**
+ * Build a WebviewPanel for tests. Signature matches
+ * vscode.window.createWebviewPanel so it drops in via mockImplementation.
+ */
+export function createMockWebviewPanel(
+	viewType: string,
+	title: string,
+	showOptions:
+		| vscode.ViewColumn
+		| {
+				readonly viewColumn: vscode.ViewColumn;
+				readonly preserveFocus?: boolean;
+		  },
+	options?: vscode.WebviewPanelOptions & vscode.WebviewOptions,
+): { panel: vscode.WebviewPanel; hooks: WebviewPanelTestHooks } {
+	const viewStateEmitter =
+		new vscode.EventEmitter<vscode.WebviewPanelOnDidChangeViewStateEvent>();
+	const disposeEmitter = new vscode.EventEmitter<void>();
+	const { webview, messageEmitter, postedMessages } = createMockWebview(
+		options ?? { enableScripts: true, localResourceRoots: [] },
+	);
+
+	const viewColumn =
+		typeof showOptions === "object" ? showOptions.viewColumn : showOptions;
+	let visible = true;
+
+	const panel: vscode.WebviewPanel = {
+		viewType,
+		title,
+		iconPath: undefined,
+		webview,
+		options: options ?? {},
+		get viewColumn() {
+			return viewColumn;
+		},
+		get active() {
+			return visible;
+		},
+		get visible() {
+			return visible;
+		},
+		onDidChangeViewState: viewStateEmitter.event,
+		onDidDispose: disposeEmitter.event,
+		reveal: () => undefined,
+		dispose: () => disposeEmitter.fire(),
+	};
+
+	const hooks: WebviewPanelTestHooks = {
+		setVisible(next) {
+			visible = next;
+			viewStateEmitter.fire({ webviewPanel: panel });
+		},
+		fireDispose() {
+			disposeEmitter.fire();
+		},
+		sendFromWebview(msg) {
+			messageEmitter.fire(msg);
+		},
+		postedMessages,
+	};
+
+	return { panel, hooks };
+}
+
+/** Hooks to drive lifecycle and inspect messages on a mocked WebviewView. */
+export interface WebviewViewTestHooks {
+	/** Flip `view.visible` and fire `onDidChangeVisibility`. */
+	setVisible(visible: boolean): void;
+	fireDispose(): void;
+	/** Deliver a message as if the webview sent it. */
+	sendFromWebview(msg: unknown): void;
+	/** Every message the extension posted to the webview, oldest first. */
+	readonly postedMessages: readonly unknown[];
+	clearPostedMessages(): void;
+}
+
+/**
+ * Build a WebviewView for tests with real event emitters. Starts hidden
+ * unless `visible` says otherwise; drive it through the returned hooks.
+ */
+export function createMockWebviewView(
+	viewType: string,
+	options: { visible?: boolean } = {},
+): { view: vscode.WebviewView; hooks: WebviewViewTestHooks } {
+	const visibilityEmitter = new vscode.EventEmitter<void>();
+	const disposeEmitter = new vscode.EventEmitter<void>();
+	const { webview, messageEmitter, postedMessages } = createMockWebview({
+		enableScripts: false,
+		localResourceRoots: [],
+	});
+	let visible = options.visible ?? false;
+
+	const view: vscode.WebviewView = {
+		viewType,
+		webview,
+		get visible() {
+			return visible;
+		},
+		show: vi.fn(),
+		onDidChangeVisibility: visibilityEmitter.event,
+		onDidDispose: disposeEmitter.event,
+	};
+
+	const hooks: WebviewViewTestHooks = {
+		setVisible(next) {
+			visible = next;
+			visibilityEmitter.fire();
+		},
+		fireDispose() {
+			disposeEmitter.fire();
+		},
+		sendFromWebview(msg) {
+			messageEmitter.fire(msg);
+		},
+		postedMessages,
+		clearPostedMessages() {
+			postedMessages.length = 0;
+		},
+	};
+
+	return { view, hooks };
 }
 
 export function createMockStream(
@@ -542,6 +974,7 @@ export class MockCoderApi implements Pick<
 	| "setCredentials"
 	| "getHost"
 	| "getSessionToken"
+	| "hasAuthConfigChangedSince"
 	| "getAuthenticatedUser"
 	| "dispose"
 	| "getExperiments"
@@ -568,6 +1001,9 @@ export class MockCoderApi implements Pick<
 
 	readonly getHost = vi.fn(() => this._host);
 	readonly getSessionToken = vi.fn(() => this._token);
+	readonly hasAuthConfigChangedSince = vi.fn(
+		(version: number | undefined) => version !== undefined && version !== 0,
+	);
 
 	readonly getAuthenticatedUser = vi.fn((): Promise<User> => {
 		if (this.authenticatedUser instanceof Error) {
@@ -583,8 +1019,8 @@ export class MockCoderApi implements Pick<
 		this._disposed = true;
 	});
 
-	readonly getExperiments = vi.fn(
-		(): Promise<Experiment[]> => Promise.resolve([]),
+	readonly getExperiments = vi.fn((): Promise<Experiment[]> =>
+		Promise.resolve([]),
 	);
 
 	/**
@@ -629,7 +1065,7 @@ export class MockOAuthSessionManager {
 	readonly refreshToken = vi
 		.fn()
 		.mockResolvedValue({ access_token: "test-token" });
-	readonly revokeRefreshToken = vi.fn().mockResolvedValue(undefined);
+	readonly revokeTokens = vi.fn().mockResolvedValue(undefined);
 	readonly isLoggedInWithOAuth = vi.fn().mockResolvedValue(false);
 	readonly clearOAuthState = vi.fn().mockResolvedValue(undefined);
 	readonly dispose = vi.fn();
@@ -639,6 +1075,24 @@ export class MockOAuthInterceptor {
 	readonly setDeployment = vi.fn().mockResolvedValue(undefined);
 	readonly clearDeployment = vi.fn();
 	readonly dispose = vi.fn();
+}
+
+/**
+ * Build a workspace in `status` with the given agents on its latest build.
+ * `build` overrides other `latest_build` fields.
+ */
+export function workspaceWith(
+	status: WorkspaceStatus,
+	agents: WorkspaceAgent[] = [],
+	build: Partial<WorkspaceBuild> = {},
+): Workspace {
+	return createWorkspace({
+		latest_build: {
+			status,
+			resources: [createResource({ agents })],
+			...build,
+		},
+	});
 }
 
 /**
@@ -662,6 +1116,20 @@ export function createMockUser(overrides: Partial<User> = {}): User {
 		has_ai_seat: false,
 		...overrides,
 	};
+}
+
+/** A user holding `names` as their deployment-wide roles. */
+export function userWithRoles(...names: string[]): User {
+	return createMockUser({
+		roles: names.map((name) => ({ name, display_name: name })),
+	});
+}
+
+/** A session signed in to TEST_DEPLOYMENT as `user`. */
+export function signedInSession(
+	user: User = createMockUser(),
+): SignedInSession {
+	return { kind: "signedIn", deployment: TEST_DEPLOYMENT, user };
 }
 
 /**
@@ -1024,5 +1492,98 @@ export class MockTerminalOutputChannel {
 	clear(): void {
 		this._lines.length = 0;
 		this.write.mockClear();
+	}
+}
+
+/** Default user id of TestSessionStore's initial signed-in session. */
+export const TEST_CURRENT_USER_ID = "current-user";
+
+/** The deployment tests sign in to. */
+export const TEST_DEPLOYMENT: Deployment = {
+	url: "https://coder.example.com",
+	safeHostname: "coder.example.com",
+};
+
+/**
+ * Real SessionStore that starts signed in as TEST_CURRENT_USER_ID, with
+ * id-only sign-in/out helpers for tests that switch users.
+ */
+export class TestSessionStore extends SessionStore {
+	constructor() {
+		super();
+		this.signInAs(TEST_CURRENT_USER_ID);
+	}
+
+	signInAs(userId = TEST_CURRENT_USER_ID): void {
+		this.signIn(TEST_DEPLOYMENT, createMockUser({ id: userId }));
+	}
+
+	override signOut(deployment: Deployment | null = null): SessionData {
+		return super.signOut(deployment);
+	}
+}
+
+interface WorkspacesResponse {
+	workspaces: readonly Workspace[];
+	count: number;
+}
+
+/** A metadata socket, as MockWorkspacesClient hands one out. */
+export type MockMetadataStream = MockEventStream<{
+	data: AgentMetadataEvent[];
+}>;
+
+/**
+ * Stands in for CoderApi at the boundaries WorkspaceProvider touches: the
+ * workspaces query and the per-agent metadata socket. Program responses with
+ * respondOnce()/pending(); metadata flows through a real MockEventStream so
+ * tests drive the production watcher rather than a stub.
+ */
+export class MockWorkspacesClient {
+	readonly metadataStreams = new Map<string, MockMetadataStream>();
+
+	readonly getWorkspaces = vi.fn(
+		(_req: { q: string }): Promise<WorkspacesResponse> =>
+			Promise.resolve({ workspaces: [], count: 0 }),
+	);
+
+	readonly getHost = vi.fn((): string | undefined => TEST_DEPLOYMENT.url);
+
+	watchAgentMetadata(agentId: string) {
+		const stream: MockMetadataStream = new MockEventStream();
+		this.metadataStreams.set(agentId, stream);
+		return Promise.resolve(stream);
+	}
+
+	/** The socket opened for `agentId`, failing the test when there is none. */
+	metadataStream(agentId: string): MockMetadataStream {
+		const stream = this.metadataStreams.get(agentId);
+		if (!stream) {
+			throw new Error(`No metadata socket for ${agentId}`);
+		}
+		return stream;
+	}
+
+	/** Resolve the next getWorkspaces call with these workspaces. */
+	respondOnce(workspaces: readonly Workspace[]): void {
+		this.getWorkspaces.mockResolvedValueOnce({
+			workspaces,
+			count: workspaces.length,
+		});
+	}
+
+	/** Make the next getWorkspaces call hang until the test settles it. */
+	pending(): {
+		resolve: (workspaces: readonly Workspace[]) => void;
+		reject: (error: unknown) => void;
+	} {
+		const { promise, resolve, reject } =
+			Promise.withResolvers<WorkspacesResponse>();
+		this.getWorkspaces.mockReturnValueOnce(promise);
+		return {
+			resolve: (workspaces) =>
+				resolve({ workspaces, count: workspaces.length }),
+			reject,
+		};
 	}
 }

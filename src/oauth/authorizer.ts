@@ -1,21 +1,25 @@
+import { createHash, randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 
 import { CoderApi } from "../api/coderApi";
+import { resolveCoderDashboardUrl } from "../common/url";
 
 import {
 	AUTH_GRANT_TYPE,
 	DEFAULT_OAUTH_SCOPES,
+	IF_SUPPORTED_OAUTH_SCOPES,
 	PKCE_CHALLENGE_METHOD,
 	RESPONSE_TYPE,
 	TOKEN_ENDPOINT_AUTH_METHOD,
+	CALLBACK_PATH,
 } from "./constants";
 import { OAuthMetadataClient } from "./metadataClient";
+import { toUrlSearchParams } from "./tokens";
 import {
-	CALLBACK_PATH,
-	generatePKCE,
-	generateState,
-	toUrlSearchParams,
-} from "./utils";
+	OAuth2ClientRegistrationResponseSchema,
+	OAuth2TokenResponseSchema,
+	parseOAuthResponse,
+} from "./validation";
 
 import type { AxiosInstance } from "axios";
 import type {
@@ -27,9 +31,9 @@ import type {
 	User,
 } from "coder/site/src/api/typesGenerated";
 
-import type { SecretsManager } from "../core/secretsManager";
 import type { Deployment } from "../deployment/types";
 import type { Logger } from "../logging/logger";
+import type { SecretsManager } from "../storage/secretsManager";
 
 import type { OAuthCallback } from "./oauthCallback";
 
@@ -57,6 +61,25 @@ export class OAuthAuthorizer implements vscode.Disposable {
 		progress: vscode.Progress<{ message?: string; increment?: number }>,
 		cancellationToken: vscode.CancellationToken,
 	): Promise<{ tokenResponse: OAuth2TokenResponse; user: User }> {
+		const client = CoderApi.create(deployment.url, undefined, this.logger);
+		try {
+			return await this.runLoginFlow(
+				client,
+				deployment,
+				progress,
+				cancellationToken,
+			);
+		} finally {
+			client.dispose();
+		}
+	}
+
+	private async runLoginFlow(
+		client: CoderApi,
+		deployment: Deployment,
+		progress: vscode.Progress<{ message?: string; increment?: number }>,
+		cancellationToken: vscode.CancellationToken,
+	): Promise<{ tokenResponse: OAuth2TokenResponse; user: User }> {
 		const reportProgress = (message?: string, increment?: number): void => {
 			if (cancellationToken.isCancellationRequested) {
 				throw new Error("OAuth login cancelled by user");
@@ -64,7 +87,6 @@ export class OAuthAuthorizer implements vscode.Disposable {
 			progress.report({ message, increment });
 		};
 
-		const client = CoderApi.create(deployment.url, undefined, this.logger);
 		const axiosInstance = client.getAxiosInstance();
 
 		reportProgress("fetching metadata...", 10);
@@ -80,6 +102,7 @@ export class OAuthAuthorizer implements vscode.Disposable {
 
 		reportProgress("waiting for authorization...", 30);
 		const { code, verifier } = await this.startAuthorization(
+			deployment.url,
 			metadata,
 			registration,
 			cancellationToken,
@@ -94,7 +117,6 @@ export class OAuthAuthorizer implements vscode.Disposable {
 			registration,
 		);
 
-		// Set token on client to fetch user
 		client.setSessionToken(tokenResponse.access_token);
 
 		reportProgress("fetching user...", 20);
@@ -102,10 +124,7 @@ export class OAuthAuthorizer implements vscode.Disposable {
 
 		this.logger.debug("OAuth login flow completed successfully");
 
-		return {
-			tokenResponse,
-			user,
-		};
+		return { tokenResponse, user };
 	}
 
 	/**
@@ -157,22 +176,29 @@ export class OAuthAuthorizer implements vscode.Disposable {
 			registrationRequest,
 		);
 
+		const registrationResponse = parseOAuthResponse(
+			OAuth2ClientRegistrationResponseSchema,
+			response.data,
+			metadata.registration_endpoint,
+		);
+
 		await this.secretsManager.setOAuthClientRegistration(
 			deployment.safeHostname,
-			response.data,
+			registrationResponse,
 		);
 		this.logger.debug(
 			"Saved OAuth client registration:",
-			response.data.client_id,
+			registrationResponse.client_id,
 		);
 
-		return response.data;
+		return registrationResponse;
 	}
 
 	/**
 	 * Build authorization URL with all required OAuth 2.1 parameters.
 	 */
 	private buildAuthorizationUrl(
+		connectionUrl: string,
 		metadata: OAuth2AuthorizationServerMetadata,
 		clientId: string,
 		state: string,
@@ -185,31 +211,43 @@ export class OAuthAuthorizer implements vscode.Disposable {
 			);
 			if (unsupportedScopes.length > 0) {
 				this.logger.warn(
-					`Requested scopes not in server's supported scopes: ${unsupportedScopes.join(", ")}. Server may still accept them.`,
+					`Requested scopes not in server's supported scopes: ${unsupportedScopes.join(", ")}. Servers that enforce scopes reject the request.`,
 					{ supported_scopes: metadata.scopes_supported },
 				);
 			}
 		}
 
+		const scope = [
+			DEFAULT_OAUTH_SCOPES,
+			...IF_SUPPORTED_OAUTH_SCOPES.filter((s) =>
+				metadata.scopes_supported?.includes(s),
+			),
+		].join(" ");
 		const params = new URLSearchParams({
 			client_id: clientId,
 			response_type: RESPONSE_TYPE,
 			redirect_uri: this.getRedirectUri(),
-			scope: DEFAULT_OAUTH_SCOPES,
+			scope,
 			state,
 			code_challenge: challenge,
 			code_challenge_method: PKCE_CHALLENGE_METHOD,
 		});
 
-		const url = `${metadata.authorization_endpoint}?${params.toString()}`;
+		const endpoint = toBrowserAuthorizationUrl(
+			metadata.authorization_endpoint,
+			connectionUrl,
+		);
+		for (const [key, value] of params) {
+			endpoint.searchParams.set(key, value);
+		}
 
 		this.logger.debug("Built OAuth authorization URL:", {
 			client_id: clientId,
 			redirect_uri: this.getRedirectUri(),
-			scope: DEFAULT_OAUTH_SCOPES,
+			scope,
 		});
 
-		return url;
+		return endpoint.toString();
 	}
 
 	/**
@@ -218,6 +256,7 @@ export class OAuthAuthorizer implements vscode.Disposable {
 	 * Returns authorization code and PKCE verifier on success.
 	 */
 	private async startAuthorization(
+		connectionUrl: string,
 		metadata: OAuth2AuthorizationServerMetadata,
 		registration: OAuth2ClientRegistrationResponse,
 		cancellationToken: vscode.CancellationToken,
@@ -226,6 +265,7 @@ export class OAuthAuthorizer implements vscode.Disposable {
 		const { verifier, challenge } = generatePKCE();
 
 		const authUrl = this.buildAuthorizationUrl(
+			connectionUrl,
 			metadata,
 			registration.client_id,
 			state,
@@ -335,7 +375,11 @@ export class OAuthAuthorizer implements vscode.Disposable {
 
 		this.logger.debug("Token exchange successful");
 
-		return response.data;
+		return parseOAuthResponse(
+			OAuth2TokenResponseSchema,
+			response.data,
+			metadata.token_endpoint,
+		);
 	}
 
 	public dispose(): void {
@@ -344,4 +388,54 @@ export class OAuthAuthorizer implements vscode.Disposable {
 			this.pendingAuthReject = null;
 		}
 	}
+}
+
+/**
+ * Swap the server's authorization endpoint onto the browser-facing URL
+ * (`alternativeWebUrl`) when it lives under the connection URL, preserving any
+ * sub-path prefix. Endpoints on a different host are left untouched.
+ */
+function toBrowserAuthorizationUrl(
+	authorizationEndpoint: string,
+	connectionUrl: string,
+): URL {
+	const endpoint = new URL(authorizationEndpoint);
+	const connectionBase = new URL(connectionUrl);
+	const browserBase = new URL(resolveCoderDashboardUrl(connectionUrl));
+	const connectionPrefix = connectionBase.pathname.replace(/\/$/, "");
+	const browserPrefix = browserBase.pathname.replace(/\/$/, "");
+	const underConnection =
+		endpoint.origin === connectionBase.origin &&
+		(connectionPrefix === "" ||
+			endpoint.pathname === connectionPrefix ||
+			endpoint.pathname.startsWith(`${connectionPrefix}/`));
+	if (underConnection) {
+		endpoint.protocol = browserBase.protocol;
+		endpoint.hostname = browserBase.hostname;
+		endpoint.port = browserBase.port;
+		endpoint.pathname = `${browserPrefix}${endpoint.pathname.slice(connectionPrefix.length)}`;
+	}
+	return endpoint;
+}
+
+interface PKCEChallenge {
+	verifier: string;
+	challenge: string;
+}
+
+/**
+ * Generates a PKCE challenge pair (RFC 7636).
+ * Creates a code verifier and its SHA256 challenge for secure OAuth flows.
+ */
+function generatePKCE(): PKCEChallenge {
+	const verifier = randomBytes(32).toString("base64url");
+	const challenge = createHash("sha256").update(verifier).digest("base64url");
+	return { verifier, challenge };
+}
+
+/**
+ * Generates a cryptographically secure state parameter to prevent CSRF attacks (RFC 6749).
+ */
+function generateState(): string {
+	return randomBytes(16).toString("base64url");
 }

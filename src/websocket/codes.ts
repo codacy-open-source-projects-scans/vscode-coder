@@ -1,5 +1,8 @@
+import { HttpStatusCode } from "../api/httpStatusCode";
+
 /**
- * WebSocket close codes (RFC 6455) and HTTP status codes for socket connections.
+ * WebSocket close codes (RFC 6455) and the HTTP handshake statuses that end
+ * socket reconnection.
  * @see https://www.rfc-editor.org/rfc/rfc6455#section-7.4.1
  */
 
@@ -15,20 +18,6 @@ export const WebSocketCloseCode = {
 	UNSUPPORTED_DATA: 1003,
 	/** Abnormal closure - connection closed without close frame (network issues) */
 	ABNORMAL: 1006,
-} as const;
-
-/** HTTP status codes used for socket creation and connection logic */
-export const HttpStatusCode = {
-	/** Authentication required */
-	UNAUTHORIZED: 401,
-	/** Permission denied */
-	FORBIDDEN: 403,
-	/** Endpoint not found */
-	NOT_FOUND: 404,
-	/** Resource permanently gone */
-	GONE: 410,
-	/** Protocol upgrade required */
-	UPGRADE_REQUIRED: 426,
 } as const;
 
 /**
@@ -52,8 +41,18 @@ export const UNRECOVERABLE_HTTP_CODES = new Set<number>([
 	HttpStatusCode.UPGRADE_REQUIRED,
 ]);
 
-/** Close codes indicating intentional closure - do not reconnect */
-export const NORMAL_CLOSURE_CODES = new Set<number>([
-	WebSocketCloseCode.NORMAL,
-	WebSocketCloseCode.GOING_AWAY,
-]);
+export class HandshakeError extends Error {
+	constructor(
+		readonly statusCode: number,
+		message = `HTTP handshake failed (${statusCode})`,
+		options?: ErrorOptions,
+	) {
+		super(message, options);
+		this.name = "HandshakeError";
+	}
+}
+
+/** HTTP status from a failed `ws` or `eventsource` handshake, or `undefined`. */
+export function handshakeStatus(error: unknown): number | undefined {
+	return error instanceof HandshakeError ? error.statusCode : undefined;
+}

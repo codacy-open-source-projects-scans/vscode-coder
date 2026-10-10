@@ -1,9 +1,14 @@
 import { CoderApi } from "../api/coderApi";
+import {
+	AuthTelemetry,
+	type AuthTokenRefreshTrigger,
+} from "../instrumentation/auth";
 
 import { DEFAULT_OAUTH_SCOPES, REFRESH_GRANT_TYPE } from "./constants";
 import { OAuthError, parseOAuthError } from "./errors";
 import { OAuthMetadataClient } from "./metadataClient";
-import { buildOAuthTokenData, toUrlSearchParams } from "./utils";
+import { buildOAuthTokenData, toUrlSearchParams } from "./tokens";
+import { OAuth2TokenResponseSchema, parseOAuthResponse } from "./validation";
 
 import type { AxiosInstance } from "axios";
 import type {
@@ -15,10 +20,10 @@ import type {
 } from "coder/site/src/api/typesGenerated";
 import type * as vscode from "vscode";
 
-import type { ServiceContainer } from "../core/container";
-import type { OAuthTokenData, SecretsManager } from "../core/secretsManager";
+import type { ServiceContainer } from "../container";
 import type { Deployment } from "../deployment/types";
 import type { Logger } from "../logging/logger";
+import type { OAuthTokenData, SecretsManager } from "../storage/secretsManager";
 
 /**
  * Token refresh threshold: refresh when token expires in less than this time.
@@ -64,6 +69,7 @@ export class OAuthSessionManager implements vscode.Disposable {
 			container.getSecretsManager(),
 			container.getLogger(),
 			onAuthRequired,
+			new AuthTelemetry(container.getTelemetryService()),
 		);
 		manager.setupTokenListener();
 		manager.scheduleNextRefresh();
@@ -75,6 +81,7 @@ export class OAuthSessionManager implements vscode.Disposable {
 		private readonly secretsManager: SecretsManager,
 		private readonly logger: Logger,
 		private readonly onAuthRequired: () => Promise<void>,
+		private readonly authTelemetry: AuthTelemetry,
 	) {}
 
 	/**
@@ -91,8 +98,7 @@ export class OAuthSessionManager implements vscode.Disposable {
 	/**
 	 * Get stored tokens fresh from secrets manager.
 	 * Always reads from storage to ensure cross-window synchronization.
-	 * Validates that tokens match current deployment URL and have required scopes.
-	 * Invalid tokens are cleared and undefined is returned.
+	 * Returns undefined for tokens of another deployment URL.
 	 */
 	private async getStoredTokens(): Promise<StoredTokens | undefined> {
 		if (!this.deployment) {
@@ -115,17 +121,24 @@ export class OAuthSessionManager implements vscode.Disposable {
 			return undefined;
 		}
 
-		if (!this.hasRequiredScopes(auth.oauth.scope)) {
-			this.logger.warn("Stored tokens have insufficient scopes", {
-				scope: auth.oauth.scope,
-			});
-			return undefined;
-		}
-
 		return {
 			access_token: auth.token,
 			...auth.oauth,
 		};
+	}
+
+	/** Stored tokens, or undefined when they lack a required scope. */
+	private async getTokensWithRequiredScopes(): Promise<
+		StoredTokens | undefined
+	> {
+		const storedTokens = await this.getStoredTokens();
+		if (storedTokens && !this.hasRequiredScopes(storedTokens.scope)) {
+			this.logger.warn("Stored tokens have insufficient scopes", {
+				scope: storedTokens.scope,
+			});
+			return undefined;
+		}
+		return storedTokens;
 	}
 
 	/**
@@ -179,7 +192,7 @@ export class OAuthSessionManager implements vscode.Disposable {
 			this.refreshTimer = undefined;
 		}
 
-		this.getStoredTokens()
+		this.getTokensWithRequiredScopes()
 			.then((storedTokens) => {
 				if (!storedTokens?.refresh_token) {
 					return;
@@ -218,7 +231,7 @@ export class OAuthSessionManager implements vscode.Disposable {
 
 		this.refreshTimer = undefined;
 
-		this.refreshToken()
+		this.refreshToken("background")
 			.then(() => {
 				this.logger.debug("Background token refresh succeeded");
 			})
@@ -255,6 +268,9 @@ export class OAuthSessionManager implements vscode.Disposable {
 	 */
 	private hasRequiredScopes(grantedScope: string): boolean {
 		const grantedScopes = new Set(grantedScope.split(" "));
+		if (grantedScopes.has("coder:all")) {
+			return true;
+		}
 		const requiredScopes = DEFAULT_OAUTH_SCOPES.split(" ");
 
 		for (const required of requiredScopes) {
@@ -279,29 +295,39 @@ export class OAuthSessionManager implements vscode.Disposable {
 	}
 
 	/**
-	 * Prepare common OAuth operation setup: client, metadata, and registration.
-	 * Used by refresh and revoke operations to reduce duplication.
+	 * Run `fn` with a per-call CoderApi configured for the current
+	 * deployment. The client is disposed on exit so its config-change
+	 * subscriptions never outlive the operation.
 	 */
-	private async prepareOAuthOperation(token?: string): Promise<{
-		axiosInstance: AxiosInstance;
-		metadata: OAuth2AuthorizationServerMetadata;
-		registration: OAuth2ClientRegistrationResponse;
-	}> {
+	private async withOAuthOperation<T>(
+		token: string | undefined,
+		fn: (ctx: {
+			axiosInstance: AxiosInstance;
+			metadata: OAuth2AuthorizationServerMetadata;
+			registration: OAuth2ClientRegistrationResponse;
+		}) => Promise<T>,
+	): Promise<T> {
 		const deployment = this.requireDeployment();
 		const client = CoderApi.create(deployment.url, token, this.logger);
-		const axiosInstance = client.getAxiosInstance();
+		try {
+			const axiosInstance = client.getAxiosInstance();
+			const metadataClient = new OAuthMetadataClient(
+				axiosInstance,
+				this.logger,
+			);
+			const metadata = await metadataClient.getMetadata();
 
-		const metadataClient = new OAuthMetadataClient(axiosInstance, this.logger);
-		const metadata = await metadataClient.getMetadata();
+			const registration = await this.secretsManager.getOAuthClientRegistration(
+				deployment.safeHostname,
+			);
+			if (!registration) {
+				throw new Error("No client registration found");
+			}
 
-		const registration = await this.secretsManager.getOAuthClientRegistration(
-			deployment.safeHostname,
-		);
-		if (!registration) {
-			throw new Error("No client registration found");
+			return await fn({ axiosInstance, metadata, registration });
+		} finally {
+			client.dispose();
 		}
-
-		return { axiosInstance, metadata, registration };
 	}
 
 	public async setDeployment(deployment: Deployment): Promise<void> {
@@ -314,7 +340,7 @@ export class OAuthSessionManager implements vscode.Disposable {
 		this.deployment = deployment;
 		this.clearRefreshState();
 
-		const storedTokens = await this.getStoredTokens();
+		const storedTokens = await this.getTokensWithRequiredScopes();
 		if (storedTokens) {
 			this.logger.debug("Switching OAuth deployment", deployment);
 		}
@@ -342,17 +368,22 @@ export class OAuthSessionManager implements vscode.Disposable {
 	 * Refresh the access token using the stored refresh token.
 	 * Uses a shared promise to handle concurrent refresh attempts.
 	 */
-	public async refreshToken(): Promise<OAuth2TokenResponse> {
+	public async refreshToken(
+		trigger: AuthTokenRefreshTrigger = "reactive",
+	): Promise<OAuth2TokenResponse> {
 		if (this.refreshPromise) {
 			this.logger.debug(
 				"Token refresh already in progress, waiting for result",
 			);
+			this.authTelemetry.logTokenRefreshDeduped(trigger);
 			return this.refreshPromise;
 		}
 
 		const deployment = this.requireDeployment();
 		// Assign synchronously before any async work to prevent race conditions
-		this.refreshPromise = this.executeTokenRefresh(deployment);
+		this.refreshPromise = this.authTelemetry.traceTokenRefresh(trigger, () =>
+			this.executeTokenRefresh(deployment),
+		);
 		return this.refreshPromise;
 	}
 
@@ -363,7 +394,7 @@ export class OAuthSessionManager implements vscode.Disposable {
 		this.refreshAbortController = abortController;
 
 		try {
-			const storedTokens = await this.getStoredTokens();
+			const storedTokens = await this.getTokensWithRequiredScopes();
 			if (!storedTokens?.refresh_token) {
 				throw new Error("No refresh token available");
 			}
@@ -371,46 +402,54 @@ export class OAuthSessionManager implements vscode.Disposable {
 			const refreshToken = storedTokens.refresh_token;
 			const accessToken = storedTokens.access_token;
 
-			const { axiosInstance, metadata, registration } =
-				await this.prepareOAuthOperation(accessToken);
+			return await this.withOAuthOperation(
+				accessToken,
+				async ({ axiosInstance, metadata, registration }) => {
+					this.logger.debug("Refreshing access token");
 
-			this.logger.debug("Refreshing access token");
+					const params: OAuth2TokenRequest = {
+						grant_type: REFRESH_GRANT_TYPE,
+						refresh_token: refreshToken,
+						client_id: registration.client_id,
+						client_secret: registration.client_secret,
+					};
 
-			const params: OAuth2TokenRequest = {
-				grant_type: REFRESH_GRANT_TYPE,
-				refresh_token: refreshToken,
-				client_id: registration.client_id,
-				client_secret: registration.client_secret,
-			};
+					const response = await axiosInstance.post<OAuth2TokenResponse>(
+						metadata.token_endpoint,
+						toUrlSearchParams(params),
+						{
+							headers: {
+								"Content-Type": "application/x-www-form-urlencoded",
+							},
+							signal: abortController.signal,
+						},
+					);
 
-			const tokenRequest = toUrlSearchParams(params);
+					if (abortController.signal.aborted) {
+						throw new Error("Token refresh aborted");
+					}
 
-			const response = await axiosInstance.post<OAuth2TokenResponse>(
-				metadata.token_endpoint,
-				tokenRequest,
-				{
-					headers: {
-						"Content-Type": "application/x-www-form-urlencoded",
-					},
-					signal: abortController.signal,
+					this.logger.debug("Token refresh successful");
+
+					const tokenResponse = parseOAuthResponse(
+						OAuth2TokenResponseSchema,
+						response.data,
+						metadata.token_endpoint,
+					);
+
+					await this.secretsManager.setSessionAuth(deployment.safeHostname, {
+						url: deployment.url,
+						token: tokenResponse.access_token,
+						username: await this.fetchUsername(
+							deployment,
+							tokenResponse.access_token,
+						),
+						oauth: buildOAuthTokenData(tokenResponse),
+					});
+
+					return tokenResponse;
 				},
 			);
-
-			// Check if aborted between response and save
-			if (abortController.signal.aborted) {
-				throw new Error("Token refresh aborted");
-			}
-
-			this.logger.debug("Token refresh successful");
-
-			const oauthData = buildOAuthTokenData(response.data);
-			await this.secretsManager.setSessionAuth(deployment.safeHostname, {
-				url: deployment.url,
-				token: response.data.access_token,
-				oauth: oauthData,
-			});
-
-			return response.data;
 		} catch (error) {
 			throw parseOAuthError(error) ?? error;
 		} finally {
@@ -421,68 +460,77 @@ export class OAuthSessionManager implements vscode.Disposable {
 		}
 	}
 
-	public async revokeRefreshToken(): Promise<void> {
-		const storedTokens = await this.getStoredTokens();
-		if (!storedTokens?.refresh_token) {
-			this.logger.debug("No refresh token to revoke");
-			return;
+	/**
+	 * Ask the deployment who the token belongs to, falling back to the stored
+	 * username so a failed lookup cannot fail the refresh.
+	 */
+	private async fetchUsername(
+		deployment: Deployment,
+		accessToken: string,
+	): Promise<string | undefined> {
+		const client = CoderApi.create(deployment.url, accessToken, this.logger);
+		try {
+			return (await client.getAuthenticatedUser()).username;
+		} catch (error) {
+			this.logger.warn("Failed to fetch the user after token refresh:", error);
+			const auth = await this.secretsManager.getSessionAuth(
+				deployment.safeHostname,
+			);
+			return auth?.username;
+		} finally {
+			client.dispose();
 		}
-
-		await this.revokeToken(
-			storedTokens.access_token,
-			storedTokens.refresh_token,
-			"refresh_token",
-		);
 	}
 
-	/**
-	 * Revoke a token using the OAuth server's revocation endpoint.
-	 *
-	 * @param authToken - Token for authenticating the revocation request
-	 * @param tokenToRevoke - The token to be revoked
-	 * @param tokenTypeHint - Hint about the token type being revoked
-	 */
-	private async revokeToken(
-		authToken: string,
-		tokenToRevoke: string,
-		tokenTypeHint: "access_token" | "refresh_token" = "refresh_token",
-	): Promise<void> {
-		const { axiosInstance, metadata, registration } =
-			await this.prepareOAuthOperation(authToken);
-
-		if (!metadata.revocation_endpoint) {
-			this.logger.debug(
-				"No revocation endpoint available, skipping revocation",
-			);
+	/** Best-effort server-side revocation of the stored refresh and access tokens; never throws. */
+	public async revokeTokens(): Promise<void> {
+		// Includes tokens lacking a required scope, which still work on the server.
+		const storedTokens = await this.getStoredTokens().catch((error) => {
+			this.logger.warn("Failed to read stored tokens for revocation:", error);
+			return undefined;
+		});
+		if (!storedTokens) {
 			return;
 		}
 
-		this.logger.debug("Revoking refresh token");
-
-		const params: OAuth2TokenRevocationRequest = {
-			token: tokenToRevoke,
-			client_id: registration.client_id,
-			client_secret: registration.client_secret,
-			token_type_hint: tokenTypeHint,
-		};
-
-		const revocationRequest = toUrlSearchParams(params);
+		// Refresh token first, while the access token still authenticates the call.
+		const targets: Array<[string, "access_token" | "refresh_token"]> = [];
+		if (storedTokens.refresh_token) {
+			targets.push([storedTokens.refresh_token, "refresh_token"]);
+		}
+		targets.push([storedTokens.access_token, "access_token"]);
 
 		try {
-			await axiosInstance.post(
-				metadata.revocation_endpoint,
-				revocationRequest,
-				{
-					headers: {
-						"Content-Type": "application/x-www-form-urlencoded",
-					},
+			await this.withOAuthOperation(
+				storedTokens.access_token,
+				async ({ axiosInstance, metadata, registration }) => {
+					const endpoint = metadata.revocation_endpoint;
+					if (!endpoint) {
+						this.logger.debug("No revocation endpoint; skipping revocation");
+						return;
+					}
+					for (const [token, token_type_hint] of targets) {
+						const params: OAuth2TokenRevocationRequest = {
+							token,
+							client_id: registration.client_id,
+							client_secret: registration.client_secret,
+							token_type_hint,
+						};
+						try {
+							await axiosInstance.post(endpoint, toUrlSearchParams(params), {
+								headers: {
+									"Content-Type": "application/x-www-form-urlencoded",
+								},
+							});
+							this.logger.debug(`Revoked ${token_type_hint}`);
+						} catch (error) {
+							this.logger.warn(`Failed to revoke ${token_type_hint}:`, error);
+						}
+					}
 				},
 			);
-
-			this.logger.debug("Token revocation successful");
 		} catch (error) {
-			this.logger.error("Token revocation failed:", error);
-			throw error;
+			this.logger.warn("Token revocation failed:", error);
 		}
 	}
 
@@ -497,7 +545,7 @@ export class OAuthSessionManager implements vscode.Disposable {
 		if (hostname && hostname !== this.deployment?.safeHostname) {
 			return false;
 		}
-		const storedTokens = await this.getStoredTokens();
+		const storedTokens = await this.getTokensWithRequiredScopes();
 		return storedTokens !== undefined;
 	}
 

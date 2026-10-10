@@ -1,0 +1,38 @@
+.ui-icon-button {
+	width: 22px;
+	height: 22px;
+	padding: 0;
+	color: var(--ui-toolbar-foreground);
+	background: transparent;
+	border: 0;
+	border-radius: var(--ui-radius-medium);
+	cursor: pointer;
+	outline: 1px solid transparent;
+	outline-offset: -1px;
+}
+
+/* One outline serves hover, toggled, and focus, so :where() keeps the
+   exclusions weightless and source order alone decides. */
+.ui-icon-button:hover:where(:not(:disabled, [aria-pressed="true"])) {
+	background: var(--ui-toolbar-hover-background);
+	outline-color: var(--ui-toolbar-hover-outline);
+	outline-style: dashed;
+}
+
+.ui-icon-button:active:where(:not(:disabled, [aria-pressed="true"])) {
+	background: var(--ui-toolbar-active-background);
+}
+
+/* A toggled button keeps its active colors on hover, like native */
+.ui-icon-button[aria-pressed="true"] {
+	color: var(--ui-input-option-active-foreground);
+	background: var(--ui-input-option-active-background);
+	outline-color: var(--ui-input-option-active-border);
+	outline-style: solid;
+}
+
+/* Last: native's ring is an outline, the others border colors, so it wins */
+.ui-icon-button:focus {
+	outline-color: var(--ui-focus-border);
+	outline-style: solid;
+}

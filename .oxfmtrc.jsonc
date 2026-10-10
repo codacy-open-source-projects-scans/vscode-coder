@@ -1,0 +1,22 @@
+{
+	"$schema": "./node_modules/oxfmt/configuration_schema.json",
+	"printWidth": 80,
+	// Disabled to avoid churning the key order of every package.json in the repo.
+	"sortPackageJson": false,
+	// Oxfmt also skips everything in .gitignore.
+	"ignorePatterns": [
+		"flake.lock",
+		"pnpm-lock.yaml",
+		// Golden snapshots and generated VS Code theme dumps are written verbatim.
+		"**/__golden__/",
+		".storybook/themes/generated/"
+	],
+	"overrides": [
+		{
+			"files": ["*.jsonc"],
+			"options": {
+				"trailingComma": "none"
+			}
+		}
+	]
+}

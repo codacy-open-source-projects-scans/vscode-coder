@@ -36,9 +36,9 @@ vi.mock("@/headers", () => ({
 	getHeaderCommand: vi.fn(),
 }));
 
-vi.mock("@/api/utils", async () => {
+vi.mock("@/api/httpAgent", async () => {
 	const actual =
-		await vi.importActual<typeof import("@/api/utils")>("@/api/utils");
+		await vi.importActual<typeof import("@/api/httpAgent")>("@/api/httpAgent");
 	return { ...actual, createHttpAgent: vi.fn() };
 });
 
@@ -75,23 +75,30 @@ describe("OAuthMetadataClient", () => {
 			expect(result).toEqual(metadata);
 		});
 
-		describe("required endpoints validation", () => {
-			it.each(["authorization_endpoint", "token_endpoint", "issuer"])(
-				"throws when %s missing",
-				async (field) => {
-					const { mockAdapter, client } = createTestContext();
+		it.each<[string, Record<string, unknown>]>([
+			[
+				"authorization_endpoint is missing",
+				{ authorization_endpoint: undefined },
+			],
+			["token_endpoint is missing", { token_endpoint: undefined }],
+			["issuer is missing", { issuer: undefined }],
+			["issuer is empty", { issuer: "" }],
+			[
+				"a *_supported field is not an array",
+				{ grant_types_supported: "authorization_code refresh_token" },
+			],
+		])("throws when %s", async (_name, overrides) => {
+			const { mockAdapter, client } = createTestContext();
 
-					setupAxiosMockRoutes(mockAdapter, {
-						"/.well-known/oauth-authorization-server": createMockOAuthMetadata(
-							TEST_URL,
-							{ [field]: undefined },
-						),
-					});
-
-					await expect(client.getMetadata()).rejects.toThrow(
-						"OAuth server metadata missing required endpoints",
-					);
+			setupAxiosMockRoutes(mockAdapter, {
+				"/.well-known/oauth-authorization-server": {
+					...createMockOAuthMetadata(TEST_URL),
+					...overrides,
 				},
+			});
+
+			await expect(client.getMetadata()).rejects.toThrow(
+				"did not return a valid Coder API response",
 			);
 		});
 

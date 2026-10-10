@@ -1,0 +1,11 @@
+.ui-search-input {
+	padding-inline-start: 2px;
+}
+
+.ui-search-input__control {
+	padding: 0 4px;
+}
+
+.ui-search-input__control::-webkit-search-cancel-button {
+	display: none;
+}

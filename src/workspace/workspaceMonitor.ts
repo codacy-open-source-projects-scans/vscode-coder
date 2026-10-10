@@ -1,21 +1,55 @@
 import {
 	type ServerSentEvent,
 	type Workspace,
+	type WorkspaceAgent,
+	type WorkspaceAgentLifecycle,
+	type WorkspaceAgentLog,
+	type WorkspaceAgentScript,
 } from "coder/site/src/api/typesGenerated";
 import { formatDistanceToNowStrict } from "date-fns";
 import * as vscode from "vscode";
 
-import { createWorkspaceIdentifier, errToStr } from "../api/api-helper";
+import { extractAgents, createWorkspaceIdentifier } from "../api/models";
+import { errToStr } from "../error/normalize";
+import {
+	recordAgentState,
+	recordWorkspaceState,
+} from "../instrumentation/workspace";
 import {
 	areNotificationsDisabled,
 	areUpdateNotificationsDisabled,
 } from "../settings/notifications";
-import { vscodeProposed } from "../vscodeProposed";
+import { createStatusBarItem } from "../ui/statusBar";
+import { vscodeProposed } from "../vscode/proposed";
+
+import {
+	INITIAL_STATE,
+	WorkspaceAgentObserver,
+	WorkspaceStateObserver,
+} from "./observers";
 
 import type { CoderApi } from "../api/coderApi";
-import type { ContextManager } from "../core/contextManager";
+import type { ServiceContainer } from "../container";
 import type { Logger } from "../logging/logger";
+import type { TelemetryReporter } from "../telemetry/reporter";
+import type { ContextManager } from "../vscode/contextManager";
 import type { UnidirectionalStream } from "../websocket/eventStreamConnection";
+
+const stateVerb = (from: string | undefined) =>
+	from === undefined ? "state observed" : "state changed";
+
+const STARTUP_SETTLED_STATES: ReadonlySet<WorkspaceAgentLifecycle> = new Set([
+	"ready",
+	"start_error",
+	"start_timeout",
+]);
+
+const describeScriptFailure = ({ status, exit_code }: WorkspaceAgentScript) => {
+	if (status === "timed_out") {
+		return "timed out";
+	}
+	return exit_code ? `exit code ${exit_code}` : "failed";
+};
 
 /**
  * Monitor a single workspace using a WebSocket for events like shutdown and deletion.
@@ -35,30 +69,35 @@ export class WorkspaceMonitor implements vscode.Disposable {
 	private notifiedDeletion = false;
 	private notifiedOutdated = false;
 	private notifiedNotRunning = false;
+	private notifiedStartupFailure = false;
 	private completedInitialSetup = false;
+	private connectedAgentId: string | undefined;
 
 	readonly onChange = new vscode.EventEmitter<Workspace>();
 	private readonly statusBarItem: vscode.StatusBarItem;
 
 	// For logging.
 	private readonly name: string;
+	private readonly telemetry: TelemetryReporter;
+	private readonly stateObserver = new WorkspaceStateObserver();
+	private readonly agentObserver = new WorkspaceAgentObserver();
+	private readonly logger: Logger;
+	private readonly contextManager: ContextManager;
 
 	private latestWorkspace: Workspace;
 
 	private constructor(
 		workspace: Workspace,
 		private readonly client: CoderApi,
-		private readonly logger: Logger,
-		private readonly contextManager: ContextManager,
+		container: ServiceContainer,
 	) {
+		this.logger = container.getLogger();
+		this.contextManager = container.getContextManager();
 		this.name = createWorkspaceIdentifier(workspace);
+		this.telemetry = container.getTelemetryService();
 		this.latestWorkspace = workspace;
 
-		const statusBarItem = vscode.window.createStatusBarItem(
-			vscode.StatusBarAlignment.Left,
-			999,
-		);
-		statusBarItem.name = "Coder Workspace Update";
+		const statusBarItem = createStatusBarItem("workspaceUpdate");
 		statusBarItem.text = "$(fold-up) Update Workspace";
 		statusBarItem.command = "coder.workspace.update";
 
@@ -75,21 +114,15 @@ export class WorkspaceMonitor implements vscode.Disposable {
 	static async create(
 		workspace: Workspace,
 		client: CoderApi,
-		logger: Logger,
-		contextManager: ContextManager,
+		container: ServiceContainer,
 	): Promise<WorkspaceMonitor> {
-		const monitor = new WorkspaceMonitor(
-			workspace,
-			client,
-			logger,
-			contextManager,
-		);
+		const monitor = new WorkspaceMonitor(workspace, client, container);
 
 		// Initialize websocket connection
 		const socket = await client.watchWorkspace(workspace);
 
 		socket.addEventListener("open", () => {
-			logger.info(`Monitoring ${monitor.name}...`);
+			monitor.logger.info(`Monitoring ${monitor.name}...`);
 		});
 
 		socket.addEventListener("message", (event) => {
@@ -116,7 +149,8 @@ export class WorkspaceMonitor implements vscode.Disposable {
 		return monitor;
 	}
 
-	public markInitialSetupComplete(): void {
+	public markInitialSetupComplete(connectedAgentId: string): void {
+		this.connectedAgentId = connectedAgentId;
 		this.completedInitialSetup = true;
 		this.maybeNotify(this.latestWorkspace);
 	}
@@ -134,9 +168,46 @@ export class WorkspaceMonitor implements vscode.Disposable {
 	}
 
 	private update(workspace: Workspace) {
+		this.observeState(workspace);
+		this.observeAgents(workspace);
 		this.latestWorkspace = workspace;
 		this.updateContext(workspace);
 		this.updateStatusBar(workspace);
+	}
+
+	private observeState(workspace: Workspace) {
+		const transition = this.stateObserver.observe(workspace);
+		if (!transition) {
+			return;
+		}
+		const verb = stateVerb(transition.from);
+		this.logger.info(`Workspace ${this.name} ${verb}`, {
+			from: transition.from ?? INITIAL_STATE,
+			to: transition.to,
+			transition: transition.buildTransition,
+			reason: transition.buildReason,
+		});
+		recordWorkspaceState(this.telemetry, this.name, transition);
+	}
+
+	private observeAgents(workspace: Workspace) {
+		const { transitions, removed } = this.agentObserver.observe(workspace);
+		for (const transition of transitions) {
+			const verb = stateVerb(transition.statusFrom);
+			this.logger.info(
+				`Workspace ${this.name} agent ${transition.agentName} ${verb}`,
+				{
+					statusFrom: transition.statusFrom ?? INITIAL_STATE,
+					statusTo: transition.statusTo,
+					lifecycleFrom: transition.lifecycleFrom ?? INITIAL_STATE,
+					lifecycleTo: transition.lifecycleTo,
+				},
+			);
+			recordAgentState(this.telemetry, this.name, transition);
+		}
+		for (const name of removed) {
+			this.logger.info(`Workspace ${this.name} agent ${name} removed`);
+		}
 	}
 
 	private maybeNotify(workspace: Workspace) {
@@ -149,6 +220,7 @@ export class WorkspaceMonitor implements vscode.Disposable {
 			this.maybeNotifyOutdated(workspace, cfg);
 			this.maybeNotifyDeletion(workspace);
 			this.maybeNotifyNotRunning(workspace);
+			this.maybeNotifyStartupFailure(workspace);
 		}
 	}
 
@@ -210,6 +282,108 @@ export class WorkspaceMonitor implements vscode.Disposable {
 		}
 	}
 
+	private maybeNotifyStartupFailure(workspace: Workspace) {
+		if (this.notifiedStartupFailure) {
+			return;
+		}
+		const agent = extractAgents(workspace.latest_build.resources).find(
+			(a) => a.id === this.connectedAgentId,
+		);
+		if (!agent || !STARTUP_SETTLED_STATES.has(agent.lifecycle_state)) {
+			return;
+		}
+		const failed = agent.scripts.filter(
+			(s) =>
+				s.run_on_start &&
+				(s.status === "exit_failure" || s.status === "timed_out"),
+		);
+		const message = this.startupFailureMessage(agent, failed);
+		if (!message) {
+			return;
+		}
+		this.notifiedStartupFailure = true;
+		vscode.window
+			.showWarningMessage(message, "Show Logs", "Open in Dashboard")
+			.then((action) => {
+				if (action === "Show Logs") {
+					void this.showStartupLogs(agent, failed);
+				} else if (action === "Open in Dashboard") {
+					vscode.commands.executeCommand("coder.navigateToWorkspace");
+				}
+			});
+	}
+
+	private startupFailureMessage(
+		agent: WorkspaceAgent,
+		failed: readonly WorkspaceAgentScript[],
+	): string | undefined {
+		const where = `agent ${agent.name} in ${this.name}`;
+		if (failed.length > 0) {
+			const noun = failed.length === 1 ? "script" : "scripts";
+			const list = failed
+				.map((s) => `"${s.display_name}" (${describeScriptFailure(s)})`)
+				.join(", ");
+			return `Startup ${noun} failed on ${where}: ${list}.`;
+		}
+		// Older servers report only the lifecycle state, not per-script statuses.
+		if (agent.lifecycle_state === "start_timeout") {
+			return `Startup scripts on ${where} are taking longer than expected and might still be running.`;
+		}
+		if (agent.lifecycle_state === "start_error") {
+			return `Startup scripts failed on ${where}.`;
+		}
+		return undefined;
+	}
+
+	private async showStartupLogs(
+		agent: WorkspaceAgent,
+		failed: readonly WorkspaceAgentScript[],
+	) {
+		try {
+			const logs = await this.client.getWorkspaceAgentLogs(agent.id);
+			const logsBySource = Map.groupBy(logs, (log) => log.source_id);
+			const failedIds = new Set(failed.map((s) => s.log_source_id));
+			const sources = agent.log_sources.filter((s) =>
+				failedIds.size > 0 ? failedIds.has(s.id) : logsBySource.has(s.id),
+			);
+			if (sources.length === 0) {
+				vscode.window.showInformationMessage(
+					`No startup logs found for agent ${agent.name}.`,
+				);
+				return;
+			}
+			const terminals = sources.map((s) =>
+				this.createLogTerminal(
+					`Startup Logs: ${s.display_name}`,
+					logsBySource.get(s.id) ?? [],
+				),
+			);
+			terminals[0].show();
+		} catch (error) {
+			const message = errToStr(error, "no further details");
+			this.logger.warn("Failed to show agent startup logs", error);
+			vscode.window.showErrorMessage(`Failed to show startup logs: ${message}`);
+		}
+	}
+
+	private createLogTerminal(
+		name: string,
+		logs: readonly WorkspaceAgentLog[],
+	): vscode.Terminal {
+		const writeEmitter = new vscode.EventEmitter<string>();
+		const output = logs
+			.map((log) => log.output.replace(/\r?\n/g, "\r\n"))
+			.join("\r\n");
+		return vscode.window.createTerminal({
+			name,
+			pty: {
+				onDidWrite: writeEmitter.event,
+				open: () => writeEmitter.fire(output),
+				close: () => writeEmitter.dispose(),
+			},
+		});
+	}
+
 	private isImpending(target: string, notifyTime: number): boolean {
 		const nowTime = Date.now();
 		const targetTime = new Date(target).getTime();
@@ -269,7 +443,10 @@ export class WorkspaceMonitor implements vscode.Disposable {
 	}
 
 	private updateStatusBar(workspace: Workspace) {
-		if (workspace.outdated) {
+		const status = workspace.latest_build.status;
+		const settled =
+			status === "running" || status === "stopped" || status === "failed";
+		if (workspace.outdated && settled) {
 			this.statusBarItem.show();
 		} else {
 			this.statusBarItem.hide();

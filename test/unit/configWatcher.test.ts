@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import * as vscode from "vscode";
 
 import {
@@ -10,25 +10,24 @@ import { MockConfigurationProvider } from "../mocks/testHelpers";
 
 describe("watchConfigurationChanges", () => {
 	const createWatcher = (...keys: string[]) => {
-		const changes: string[][] = [];
+		const changes: Array<ReadonlyMap<string, unknown>> = [];
 		const settings: WatchedSetting[] = keys.map((key) => ({
 			setting: key,
 			getValue: () => vscode.workspace.getConfiguration().get(key),
 		}));
-		const watcher = watchConfigurationChanges(settings, (changed) =>
-			changes.push(changed),
-		);
+		const watcher = watchConfigurationChanges(settings, (c) => changes.push(c));
 		return { changes, dispose: () => watcher.dispose() };
 	};
 
-	it("fires callback when watched setting value changes", () => {
+	it("fires callback with the new value when a watched setting changes", () => {
 		const config = new MockConfigurationProvider();
 		config.set("test.setting", "initial");
 		const { changes, dispose } = createWatcher("test.setting");
 
 		config.set("test.setting", "changed");
 
-		expect(changes).toEqual([["test.setting"]]);
+		expect(changes).toHaveLength(1);
+		expect(changes[0].get("test.setting")).toBe("changed");
 		dispose();
 	});
 
@@ -64,10 +63,10 @@ describe("watchConfigurationChanges", () => {
 		config.set("test.setting", "changed2"); // same value - no callback
 		config.set("test.setting", "changed1"); // back to changed1 - should fire
 
-		expect(changes).toEqual([
-			["test.setting"],
-			["test.setting"],
-			["test.setting"],
+		expect(changes.map((c) => c.get("test.setting"))).toEqual([
+			"changed1",
+			"changed2",
+			"changed1",
 		]);
 		dispose();
 	});
@@ -91,7 +90,8 @@ describe("watchConfigurationChanges", () => {
 		config.set("test.setting", { key: "value" }); // deep equal - no callback
 		config.set("test.setting", { key: "different" });
 
-		expect(changes).toEqual([["test.setting"]]);
+		expect(changes).toHaveLength(1);
+		expect(changes[0].get("test.setting")).toEqual({ key: "different" });
 		dispose();
 	});
 
@@ -131,7 +131,76 @@ describe("watchConfigurationChanges", () => {
 
 		config.set("test.setting", to);
 
-		expect(changes).toEqual([["test.setting"]]);
+		expect(changes).toHaveLength(1);
+		expect(changes[0].has("test.setting")).toBe(true);
 		dispose();
+	});
+
+	describe("debounced (idle window)", () => {
+		const setup = () => {
+			vi.useFakeTimers();
+			const config = new MockConfigurationProvider();
+			config.set("test.setting", "initial");
+			const changes: Array<ReadonlyMap<string, unknown>> = [];
+			const watcher = watchConfigurationChanges(
+				[
+					{
+						setting: "test.setting",
+						getValue: () =>
+							vscode.workspace.getConfiguration().get("test.setting"),
+					},
+				],
+				(c) => changes.push(c),
+				{ debounceMs: 250 },
+			);
+			return { config, changes, watcher };
+		};
+
+		it("coalesces changes within the window and emits the final value", () => {
+			const { config, changes, watcher } = setup();
+			try {
+				config.set("test.setting", "changed1");
+				config.set("test.setting", "changed2");
+				vi.advanceTimersByTime(249);
+				expect(changes).toEqual([]);
+				vi.advanceTimersByTime(1);
+				expect(changes.map((c) => c.get("test.setting"))).toEqual(["changed2"]);
+			} finally {
+				watcher.dispose();
+				vi.useRealTimers();
+			}
+		});
+
+		it("suppresses emission when the final value matches the applied value", () => {
+			const { config, changes, watcher } = setup();
+			try {
+				config.set("test.setting", "");
+				config.set("test.setting", "initial");
+				vi.advanceTimersByTime(250);
+				expect(changes).toEqual([]);
+			} finally {
+				watcher.dispose();
+				vi.useRealTimers();
+			}
+		});
+
+		it("resets the idle window on each event and fires once after the burst settles", () => {
+			const { config, changes, watcher } = setup();
+			try {
+				// Events spaced inside the window keep resetting the timer.
+				for (let i = 0; i < 5; i++) {
+					config.set("test.setting", `tick-${i}`);
+					vi.advanceTimersByTime(200);
+				}
+				expect(changes).toEqual([]);
+
+				// Once quiet, the callback fires exactly once with the last value.
+				vi.advanceTimersByTime(250);
+				expect(changes.map((c) => c.get("test.setting"))).toEqual(["tick-4"]);
+			} finally {
+				watcher.dispose();
+				vi.useRealTimers();
+			}
+		});
 	});
 });

@@ -1,0 +1,385 @@
+import { describe, expect, it, vi } from "vitest";
+
+import { Commands } from "@/commands";
+import { maybeAskUrl } from "@/ui/prompts";
+
+import { createTestCoderApi } from "../mocks/coderApi";
+import { createTelemetryHarness } from "../mocks/telemetry";
+import {
+	createMockLogger,
+	createMockUser,
+	MockUserInteraction,
+} from "../mocks/testHelpers";
+
+import type { CliManager } from "@/cli/cliManager";
+import type { ServiceContainer } from "@/container";
+import type { DeploymentManager } from "@/deployment/deploymentManager";
+import type { Deployment } from "@/deployment/types";
+import type { LoginCoordinator, LoginResult } from "@/login/loginCoordinator";
+import type { MementoManager } from "@/storage/mementoManager";
+import type { PathResolver } from "@/storage/pathResolver";
+import type { SecretsManager, SessionAuth } from "@/storage/secretsManager";
+import type { NetcheckPanelFactory } from "@/webviews/netcheck/netcheckPanelFactory";
+import type { SpeedtestPanelFactory } from "@/webviews/speedtest/speedtestPanelFactory";
+import type { DuplicateWorkspaceIpc } from "@/workspace/duplicateWorkspaceIpc";
+
+vi.mock("@/ui/prompts", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("@/ui/prompts")>();
+	return { ...actual, maybeAskUrl: vi.fn() };
+});
+
+vi.mock("@/workspace/workspacesProvider", () => {
+	class AgentTreeItem {}
+	class WorkspaceTreeItem {}
+	return { AgentTreeItem, WorkspaceTreeItem };
+});
+
+const TEST_URL = "https://coder.example.com";
+const TEST_HOSTNAME = "coder.example.com";
+
+type LoginResultForTest = LoginResult & {
+	readonly user?: ReturnType<typeof createMockUser>;
+};
+
+interface SetupOptions {
+	readonly authenticated?: boolean;
+	readonly loginResult?: LoginResultForTest;
+	readonly clearAllAuthDataError?: Error;
+	readonly clearCredentialsResult?: boolean;
+}
+
+const TEST_SESSION: SessionAuth = {
+	url: TEST_URL,
+	token: "test-token",
+};
+
+function setup(options: SetupOptions = {}) {
+	vi.clearAllMocks();
+	const interaction = new MockUserInteraction();
+	vi.mocked(maybeAskUrl).mockResolvedValue(TEST_URL);
+
+	const { sink, service } = createTelemetryHarness();
+	const deployment: Deployment = {
+		url: TEST_URL,
+		safeHostname: TEST_HOSTNAME,
+	};
+	const loginResult =
+		options.loginResult ??
+		({
+			success: true,
+			method: "stored_token",
+			user: createMockUser(),
+			token: "test-token",
+		} satisfies LoginResultForTest);
+	const loginCoordinator: Pick<LoginCoordinator, "ensureLoggedIn"> = {
+		ensureLoggedIn: vi.fn(() => Promise.resolve(loginResult)),
+	};
+
+	const deploymentManager: Pick<
+		DeploymentManager,
+		| "isAuthenticated"
+		| "getCurrentDeployment"
+		| "setDeployment"
+		| "clearDeployment"
+	> = {
+		isAuthenticated: vi.fn(() => options.authenticated ?? false),
+		getCurrentDeployment: vi.fn(() => deployment),
+		setDeployment: vi.fn(() => Promise.resolve()),
+		clearDeployment: vi.fn(() => Promise.resolve()),
+	};
+
+	const cliManager: Pick<CliManager, "clearCredentials" | "holdsToken"> = {
+		clearCredentials: vi.fn(() =>
+			Promise.resolve(options.clearCredentialsResult ?? true),
+		),
+		holdsToken: vi.fn(() => Promise.resolve(false)),
+	};
+
+	const secretsManager: Pick<
+		SecretsManager,
+		"getCurrentDeployment" | "getSessionAuth" | "clearAllAuthData"
+	> = {
+		getCurrentDeployment: vi.fn(() => Promise.resolve(null)),
+		getSessionAuth: vi.fn(() => Promise.resolve(TEST_SESSION)),
+		clearAllAuthData: vi.fn(() => {
+			if (options.clearAllAuthDataError) {
+				return Promise.reject(options.clearAllAuthDataError);
+			}
+			return Promise.resolve();
+		}),
+	};
+
+	const serviceContainer = {
+		getTelemetryService: () => service,
+		getLogger: () => createMockLogger(),
+		getPathResolver: () => ({}) as PathResolver,
+		getMementoManager: () => ({}) as MementoManager,
+		getSecretsManager: () => secretsManager,
+		getCliManager: () => cliManager,
+		getLoginCoordinator: () => loginCoordinator,
+		getDuplicateWorkspaceIpc: () => ({}) as DuplicateWorkspaceIpc,
+		getSpeedtestPanelFactory: () => ({}) as SpeedtestPanelFactory,
+		getNetcheckPanelFactory: () => ({}) as NetcheckPanelFactory,
+	} as ServiceContainer;
+
+	const extensionClient = createTestCoderApi({ baseUrl: TEST_URL });
+
+	const commands = new Commands(
+		serviceContainer,
+		extensionClient,
+		deploymentManager as DeploymentManager,
+	);
+
+	return {
+		commands,
+		sink,
+		interaction,
+		mocks: { cliManager, deploymentManager, loginCoordinator, secretsManager },
+	};
+}
+
+describe("Commands", () => {
+	describe("login telemetry", () => {
+		it("emits one auth.login for command login success", async () => {
+			const { commands, mocks, sink } = setup();
+
+			await commands.login();
+
+			const events = sink.eventsNamed("auth.login");
+			expect(events).toHaveLength(1);
+			expect(events[0]).toMatchObject({
+				properties: {
+					source: "command",
+					method: "stored_token",
+					result: "success",
+				},
+			});
+			expect(events[0].measurements.durationMs).toEqual(expect.any(Number));
+			expect(mocks.loginCoordinator.ensureLoggedIn).toHaveBeenCalledWith(
+				expect.objectContaining({
+					safeHostname: TEST_HOSTNAME,
+					url: TEST_URL,
+				}),
+			);
+			expect(mocks.deploymentManager.setDeployment).toHaveBeenCalled();
+		});
+
+		it("uses auto_login source when requested", async () => {
+			const { commands, mocks, sink } = setup({
+				loginResult: {
+					success: true,
+					method: "provided_token",
+					user: createMockUser(),
+					token: "test-token",
+				},
+			});
+
+			await commands.login({ url: TEST_URL, autoLogin: true });
+
+			expect(sink.expectOne("auth.login").properties).toMatchObject({
+				source: "auto_login",
+				method: "provided_token",
+				result: "success",
+			});
+			expect(mocks.loginCoordinator.ensureLoggedIn).toHaveBeenCalledWith(
+				expect.objectContaining({ autoLogin: true }),
+			);
+		});
+
+		it("records URL cancellation without attempting login", async () => {
+			const { commands, mocks, sink } = setup();
+			vi.mocked(maybeAskUrl).mockResolvedValueOnce(undefined);
+
+			await commands.login();
+
+			expect(sink.expectOne("auth.login")).toMatchObject({
+				properties: {
+					source: "command",
+					method: "unknown",
+					result: "aborted",
+					reason: "no_url_provided",
+				},
+			});
+			expect(mocks.loginCoordinator.ensureLoggedIn).not.toHaveBeenCalled();
+		});
+
+		it("records auth failures as auth.login errors", async () => {
+			const { commands, mocks, sink } = setup({
+				loginResult: {
+					success: false,
+					method: "cli_token",
+					reason: "auth_failed",
+				},
+			});
+
+			await commands.login();
+
+			expect(sink.expectOne("auth.login")).toMatchObject({
+				properties: {
+					method: "cli_token",
+					result: "error",
+					"error.type": "auth_failed",
+				},
+			});
+			expect(mocks.deploymentManager.setDeployment).not.toHaveBeenCalled();
+		});
+
+		it("uses switch_deployment source", async () => {
+			const { commands, sink } = setup();
+
+			await commands.switchDeployment();
+
+			expect(sink.expectOne("auth.login").properties).toMatchObject({
+				source: "switch_deployment",
+				result: "success",
+			});
+		});
+	});
+
+	describe("logout telemetry", () => {
+		it("records not_authenticated as aborted", async () => {
+			const { commands, mocks, sink } = setup({ authenticated: false });
+
+			await commands.logout();
+
+			expect(sink.expectOne("auth.logout")).toMatchObject({
+				properties: {
+					result: "aborted",
+					reason: "not_authenticated",
+				},
+			});
+			expect(mocks.cliManager.clearCredentials).not.toHaveBeenCalled();
+		});
+
+		it("records successful logout", async () => {
+			const { commands, mocks, sink } = setup({ authenticated: true });
+
+			await commands.logout();
+
+			const event = sink.expectOne("auth.logout");
+			expect(event.properties).toMatchObject({ result: "success" });
+			expect(event.properties.reason).toBeUndefined();
+			expect(event.measurements.durationMs).toEqual(expect.any(Number));
+			expect(mocks.deploymentManager.clearDeployment).toHaveBeenCalledWith(
+				"logout",
+			);
+			expect(mocks.cliManager.holdsToken).toHaveBeenCalledWith(
+				TEST_URL,
+				TEST_SESSION.token,
+			);
+			expect(mocks.cliManager.clearCredentials).toHaveBeenCalledWith(TEST_URL, {
+				signOutCli: false,
+			});
+			expect(mocks.secretsManager.clearAllAuthData).toHaveBeenCalledWith(
+				TEST_HOSTNAME,
+			);
+		});
+
+		const CLI_PROMPT = "Sign out of the Coder CLI too?";
+
+		interface PromptCase {
+			scenario: string;
+			oauth?: boolean;
+			answer?: string;
+			/** Undefined when the logout is aborted as user_dismissed. */
+			signOutCli?: boolean;
+		}
+
+		it.each<PromptCase>([
+			{
+				scenario: "keeps the CLI session on request",
+				answer: "Keep Signed In",
+				signOutCli: false,
+			},
+			{
+				scenario: "signs out the CLI on request",
+				answer: "Sign Out",
+				signOutCli: true,
+			},
+			{
+				scenario: "signs out the CLI without asking for OAuth",
+				oauth: true,
+				signOutCli: true,
+			},
+			{ scenario: "aborts when the prompt is dismissed" },
+		])(
+			"$scenario for a shared store",
+			async ({ oauth, answer, signOutCli }) => {
+				const { commands, mocks, interaction, sink } = setup({
+					authenticated: true,
+				});
+				vi.mocked(mocks.cliManager.holdsToken).mockResolvedValueOnce(true);
+				if (oauth) {
+					vi.mocked(mocks.secretsManager.getSessionAuth).mockResolvedValueOnce({
+						...TEST_SESSION,
+						oauth: { scope: "workspace:read", expiry_timestamp: 1 },
+					});
+				}
+				interaction.setResponse(CLI_PROMPT, answer);
+
+				await commands.logout();
+
+				const prompted = interaction
+					.getMessageCalls()
+					.some((call) => call.message === CLI_PROMPT);
+				expect(prompted).toBe(!oauth);
+				if (signOutCli === undefined) {
+					expect(sink.expectOne("auth.logout").properties).toMatchObject({
+						result: "aborted",
+						reason: "user_dismissed",
+					});
+					expect(
+						mocks.deploymentManager.clearDeployment,
+					).not.toHaveBeenCalled();
+					return;
+				}
+				expect(mocks.cliManager.clearCredentials).toHaveBeenCalledWith(
+					TEST_URL,
+					{
+						signOutCli,
+					},
+				);
+			},
+		);
+
+		it("records logout exceptions", async () => {
+			const { commands, sink } = setup({
+				authenticated: true,
+				clearAllAuthDataError: new Error("secret clear failed"),
+			});
+
+			await expect(commands.logout()).rejects.toThrow("secret clear failed");
+
+			expect(sink.expectOne("auth.logout")).toMatchObject({
+				properties: { result: "error", "error.type": "exception" },
+				error: { message: "secret clear failed" },
+			});
+		});
+
+		it("reports incomplete credential cleanup instead of success", async () => {
+			const { commands, sink, interaction } = setup({
+				authenticated: true,
+				clearCredentialsResult: false,
+			});
+
+			await commands.logout();
+
+			expect(sink.expectOne("auth.logout")).toMatchObject({
+				properties: {
+					result: "aborted",
+					reason: "cleanup_incomplete",
+				},
+			});
+			const messages = interaction
+				.getMessageCalls()
+				.map((call) => call.message);
+			expect(messages).toContainEqual(
+				expect.stringContaining("could not be removed"),
+			);
+			// The success toast must not appear alongside the warning.
+			expect(messages).not.toContainEqual(
+				expect.stringContaining("You've been logged out of Coder!"),
+			);
+		});
+	});
+});

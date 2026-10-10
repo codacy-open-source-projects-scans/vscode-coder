@@ -1,0 +1,78 @@
+import path from "node:path";
+import { defineConfig } from "vitest/config";
+
+const webviewSharedAlias = path.resolve(
+	import.meta.dirname,
+	"packages/webview-shared/src",
+);
+
+// NTFS is slow with many small-file writes; double the default on Windows CI.
+const testTimeout = process.platform === "win32" ? 10_000 : 5_000;
+
+export default defineConfig({
+	test: {
+		testTimeout,
+		globalSetup: "./test/env-check.ts",
+		projects: [
+			{
+				extends: true,
+				test: {
+					name: "extension",
+					include: ["test/unit/**/*.test.ts", "test/utils/**/*.test.ts"],
+					exclude: ["**/node_modules/**", "**/out/**", "**/*.d.ts"],
+					environment: "node",
+					globals: true,
+				},
+				resolve: {
+					alias: {
+						"@": path.resolve(import.meta.dirname, "src"),
+						"@repo/webview-shared": webviewSharedAlias,
+						vscode: path.resolve(
+							import.meta.dirname,
+							"test/mocks/vscode.runtime.ts",
+						),
+					},
+				},
+			},
+			{
+				extends: true,
+				test: {
+					name: "webview",
+					include: ["test/webview/**/*.test.{ts,tsx}"],
+					exclude: ["**/node_modules/**", "**/out/**", "**/*.d.ts"],
+					environment: "jsdom",
+					// Much faster for jsdom. Not used for the extension project: Node
+					// built-ins return cross-realm values that break `instanceof Error`.
+					pool: "vmForks",
+					globals: true,
+					setupFiles: ["test/webview/setup.ts"],
+				},
+				resolve: {
+					alias: {
+						"@repo/webview-shared": webviewSharedAlias,
+						"@repo/tasks": path.resolve(
+							import.meta.dirname,
+							"packages/tasks/src",
+						),
+						"@repo/ui": path.resolve(import.meta.dirname, "packages/ui/src"),
+						"@repo/workspaces": path.resolve(
+							import.meta.dirname,
+							"packages/workspaces/src",
+						),
+						"@repo/netcheck": path.resolve(
+							import.meta.dirname,
+							"packages/netcheck/src",
+						),
+						"@repo/speedtest": path.resolve(
+							import.meta.dirname,
+							"packages/speedtest/src",
+						),
+					},
+				},
+			},
+		],
+		coverage: {
+			provider: "v8",
+		},
+	},
+});

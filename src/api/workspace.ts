@@ -1,19 +1,26 @@
-import { type Api } from "coder/site/src/api/api";
-import {
-	type WorkspaceAgentLog,
-	type ProvisionerJobLog,
-	type Workspace,
-} from "coder/site/src/api/typesGenerated";
 import { spawn } from "node:child_process";
 import * as vscode from "vscode";
 
-import { type FeatureSet } from "../featureSet";
-import { getGlobalShellFlags, type CliAuth } from "../settings/cli";
-import { escapeCommandArg } from "../util";
-import { type UnidirectionalStream } from "../websocket/eventStreamConnection";
+import { errToStr } from "../error/normalize";
+import { getGlobalFlags, type CliAuth } from "../settings/cli";
 
-import { errToStr, createWorkspaceIdentifier } from "./api-helper";
-import { type CoderApi } from "./coderApi";
+import { createWorkspaceIdentifier } from "./models";
+
+import type { Api } from "coder/site/src/api/api";
+import type {
+	CreateWorkspaceBuildOnSuccessRequest,
+	ProvisionerJobLog,
+	Workspace,
+	WorkspaceAgentLog,
+	WorkspaceBuildParameter,
+} from "coder/site/src/api/typesGenerated";
+
+import type { CliFeatureSet, ServerFeatureSet } from "../featureSet";
+import type { UnidirectionalStream } from "../websocket/eventStreamConnection";
+
+import type { CoderApi } from "./coderApi";
+
+const BUILD_REASON = "vscode_connection";
 
 /** Opens a stream once; subsequent open() calls are no-ops until closed. */
 export class LazyStream<T> {
@@ -45,51 +52,62 @@ export class LazyStream<T> {
 	}
 }
 
+type BuildApi = Pick<
+	Api,
+	| "getTemplate"
+	| "getWorkspace"
+	| "postWorkspaceBuild"
+	| "startWorkspace"
+	| "stopWorkspace"
+	| "waitForBuild"
+>;
+
 interface CliContext {
-	restClient: Api;
+	restClient: BuildApi;
 	auth: CliAuth;
 	binPath: string;
 	workspace: Workspace;
 	write: (data: string) => void;
-	featureSet: FeatureSet;
+	cliFeatures: CliFeatureSet;
+	serverFeatures: ServerFeatureSet;
 }
 
-/**
- * Spawn a Coder CLI subcommand and stream its output.
- * Resolves when the process exits successfully; rejects on non-zero exit.
- */
+/** Streams CLI output via `ctx.write`; rejects with stderr on non-zero exit. */
 function runCliCommand(ctx: CliContext, args: string[]): Promise<void> {
 	return new Promise((resolve, reject) => {
 		const fullArgs = [
-			...getGlobalShellFlags(vscode.workspace.getConfiguration(), ctx.auth),
+			...getGlobalFlags(vscode.workspace.getConfiguration(), ctx.auth),
 			...args,
 			createWorkspaceIdentifier(ctx.workspace),
 		];
-
-		const cmd = `${escapeCommandArg(ctx.binPath)} ${fullArgs.join(" ")}`;
-		const proc = spawn(cmd, { shell: true });
+		const proc = spawn(ctx.binPath, fullArgs);
+		// Unexpected prompts EOF instead of hanging forever.
+		proc.stdin.end();
 
 		proc.stdout.on("data", (data: Buffer) => {
-			ctx.write(data.toString().replace(/\r?\n/g, "\r\n"));
+			ctx.write(data.toString());
 		});
 
 		let capturedStderr = "";
 		proc.stderr.on("data", (data: Buffer) => {
 			const text = data.toString();
-			ctx.write(text.replace(/\r?\n/g, "\r\n"));
+			ctx.write(text);
 			capturedStderr += text;
 		});
 
-		proc.on("close", (code: number) => {
+		// Settle on ENOENT/EACCES; later `close` rejects are then no-ops.
+		proc.on("error", reject);
+
+		proc.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
 			if (code === 0) {
 				resolve();
-			} else {
-				let errorText = `"${fullArgs.join(" ")}" exited with code ${code}`;
-				if (capturedStderr !== "") {
-					errorText += `: ${capturedStderr}`;
-				}
-				reject(new Error(errorText));
+				return;
 			}
+			const exit =
+				code !== null ? `code ${code}` : `signal ${signal ?? "unknown"}`;
+			let msg = `"${fullArgs.join(" ")}" exited with ${exit}`;
+			if (capturedStderr) msg += `: ${capturedStderr}`;
+			reject(new Error(msg));
 		});
 	});
 }
@@ -104,8 +122,8 @@ export async function startWorkspace(ctx: CliContext): Promise<Workspace> {
 	}
 
 	const args = ["start", "--yes"];
-	if (ctx.featureSet.buildReason) {
-		args.push("--reason", "vscode_connection");
+	if (ctx.cliFeatures.buildReason) {
+		args.push("--reason", BUILD_REASON);
 	}
 
 	await runCliCommand(ctx, args);
@@ -113,29 +131,86 @@ export async function startWorkspace(ctx: CliContext): Promise<Workspace> {
 }
 
 /**
- * Update a workspace to the latest template version.
- *
- * Uses `coder update` when the CLI supports it (>= 2.24).
- * Falls back to the REST API: stop, wait, then updateWorkspaceVersion.
+ * Update a workspace to the latest template version. Callers must collect
+ * any newly-required parameters via `collectUpdateParameters` first; this
+ * function does not prompt. On servers before 2.36, updating takes two
+ * builds: `coder update`, or the REST API on CLIs before 2.24.
  */
-export async function updateWorkspace(ctx: CliContext): Promise<Workspace> {
-	if (ctx.featureSet.cliUpdate) {
-		await runCliCommand(ctx, ["update"]);
-		return ctx.restClient.getWorkspace(ctx.workspace.id);
+export async function updateWorkspace(
+	ctx: CliContext,
+	parameters: WorkspaceBuildParameter[],
+): Promise<Workspace> {
+	if (ctx.serverFeatures.onSuccessBuild) {
+		return updateWorkspaceInOneBuild(ctx, parameters);
 	}
 
-	// REST API fallback for older CLIs.
+	if (!ctx.cliFeatures.cliUpdate) {
+		return updateWorkspaceViaApi(ctx, parameters);
+	}
+
+	const paramArgs = parameters.flatMap((p) => [
+		"--parameter",
+		`${p.name}=${p.value}`,
+	]);
+	await runCliCommand(ctx, ["update", ...paramArgs]);
+	return ctx.restClient.getWorkspace(ctx.workspace.id);
+}
+
+/**
+ * Stop and start in one build, so nothing can take the slot in between. The
+ * returned workspace carries the stop build; the server starts it after.
+ */
+async function updateWorkspaceInOneBuild(
+	ctx: CliContext,
+	parameters: WorkspaceBuildParameter[],
+): Promise<Workspace> {
+	// The build may have changed while parameters were collected.
+	const workspace = await ctx.restClient.getWorkspace(ctx.workspace.id);
+	const start: CreateWorkspaceBuildOnSuccessRequest = {
+		transition: "start",
+		rich_parameter_values: parameters,
+	};
+	const running = workspace.latest_build.status === "running";
+
+	ctx.write(
+		`${running ? "Restarting" : "Starting"} workspace with the updated template...\r\n`,
+	);
+	const build = await ctx.restClient.postWorkspaceBuild(
+		workspace.id,
+		running
+			? { transition: "stop", reason: BUILD_REASON, on_success: start }
+			: {
+					...start,
+					reason: BUILD_REASON,
+					// Pinning a follow-up build needs template update permission,
+					// so only a lone start can name the version.
+					template_version_id: workspace.template_active_version_id,
+				},
+	);
+	return { ...workspace, latest_build: build };
+}
+
+async function updateWorkspaceViaApi(
+	ctx: CliContext,
+	parameters: WorkspaceBuildParameter[],
+): Promise<Workspace> {
 	if (ctx.workspace.latest_build.status === "running") {
 		ctx.write("Stopping workspace for update...\r\n");
 		const stopBuild = await ctx.restClient.stopWorkspace(ctx.workspace.id);
 		const stoppedJob = await ctx.restClient.waitForBuild(stopBuild);
-		if (stoppedJob?.status === "canceled") {
-			throw new Error("Workspace update canceled during stop");
+		if (stoppedJob?.status !== "succeeded") {
+			throw new Error("Workspace update stop build did not succeed");
 		}
 	}
 
 	ctx.write("Starting workspace with updated template...\r\n");
-	await ctx.restClient.updateWorkspaceVersion(ctx.workspace);
+	const template = await ctx.restClient.getTemplate(ctx.workspace.template_id);
+	await ctx.restClient.startWorkspace(
+		ctx.workspace.id,
+		template.active_version_id,
+		undefined,
+		parameters,
+	);
 	return ctx.restClient.getWorkspace(ctx.workspace.id);
 }
 

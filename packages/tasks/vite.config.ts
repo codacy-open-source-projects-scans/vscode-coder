@@ -1,3 +1,3 @@
-import { createWebviewConfig } from "../webview-shared/createWebviewConfig";
+import { createReactWebviewConfig } from "../webview-shared/createWebviewConfig.ts";
 
-export default createWebviewConfig("tasks", __dirname);
+export default createReactWebviewConfig("tasks", import.meta.dirname);

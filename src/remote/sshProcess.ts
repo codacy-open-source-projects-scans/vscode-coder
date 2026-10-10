@@ -3,11 +3,18 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 
-import { findPort } from "../util";
+import { cleanupFiles } from "../common/fs";
+import { SshTelemetry, type ProcessLossCause } from "../instrumentation/ssh";
+import { createStatusBarItem } from "../ui/statusBar";
 
 import { NetworkStatusReporter } from "./networkStatus";
+import {
+	isOutputLoggingDir,
+	isSharedChannelRemoteSshLog,
+} from "./sshExtension";
 
 import type { Logger } from "../logging/logger";
+import type { TelemetryReporter } from "../telemetry/reporter";
 
 /**
  * Network information from the Coder CLI.
@@ -39,6 +46,7 @@ export interface SshProcessMonitorOptions {
 	// For port-based SSH process discovery
 	codeLogDir: string;
 	remoteSshExtensionId: string;
+	telemetry: TelemetryReporter;
 }
 
 // 1 hour cleanup threshold for old network info files
@@ -55,8 +63,11 @@ const CLEANUP_MAX_LOG_FILES = 20;
 export class SshProcessMonitor implements vscode.Disposable {
 	private readonly statusBarItem: vscode.StatusBarItem;
 	private readonly options: Required<
-		SshProcessMonitorOptions & { proxyLogDir: string | undefined }
-	>;
+		Omit<SshProcessMonitorOptions, "proxyLogDir" | "telemetry">
+	> & {
+		readonly proxyLogDir: string | undefined;
+	};
+	private readonly telemetry: SshTelemetry;
 
 	private readonly _onLogFilePathChange = new vscode.EventEmitter<
 		string | undefined
@@ -76,75 +87,12 @@ export class SshProcessMonitor implements vscode.Disposable {
 	private disposed = false;
 	private currentPid: number | undefined;
 	private logFilePath: string | undefined;
-	private pendingTimeout: NodeJS.Timeout | undefined;
+	private readonly pendingDelays = new Set<{
+		timer: NodeJS.Timeout;
+		resolve: () => void;
+	}>();
 	private lastStaleSearchTime = 0;
 	private readonly reporter: NetworkStatusReporter;
-
-	/**
-	 * Helper to clean up files in a directory.
-	 * Stats files in parallel, applies selection criteria, then deletes in parallel.
-	 */
-	private static async cleanupFiles(
-		dir: string,
-		fileType: string,
-		logger: Logger,
-		options: {
-			filter: (name: string) => boolean;
-			select: (
-				files: Array<{ name: string; mtime: number }>,
-				now: number,
-			) => Array<{ name: string }>;
-		},
-	): Promise<void> {
-		try {
-			const now = Date.now();
-			const files = await fs.readdir(dir);
-
-			// Gather file stats in parallel
-			const withStats = await Promise.all(
-				files.filter(options.filter).map(async (name) => {
-					try {
-						const stats = await fs.stat(path.join(dir, name));
-						return { name, mtime: stats.mtime.getTime() };
-					} catch (error) {
-						if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-							logger.debug(`Failed to stat ${fileType} ${name}`, error);
-						}
-						return null;
-					}
-				}),
-			);
-
-			const toDelete = options.select(
-				withStats.filter((f) => f !== null),
-				now,
-			);
-
-			// Delete files in parallel
-			const results = await Promise.all(
-				toDelete.map(async (file) => {
-					try {
-						await fs.unlink(path.join(dir, file.name));
-						return file.name;
-					} catch (error) {
-						if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-							logger.debug(`Failed to delete ${fileType} ${file.name}`, error);
-						}
-						return null;
-					}
-				}),
-			);
-
-			const deletedFiles = results.filter((name) => name !== null);
-			if (deletedFiles.length > 0) {
-				logger.debug(
-					`Cleaned up ${deletedFiles.length} ${fileType}(s): ${deletedFiles.join(", ")}`,
-				);
-			}
-		} catch {
-			// Directory may not exist yet, ignore
-		}
-	}
 
 	/**
 	 * Cleans up network info files older than the specified age.
@@ -154,15 +102,11 @@ export class SshProcessMonitor implements vscode.Disposable {
 		maxAgeMs: number,
 		logger: Logger,
 	): Promise<void> {
-		await SshProcessMonitor.cleanupFiles(
-			networkInfoPath,
-			"network info file",
-			logger,
-			{
-				filter: (name) => name.endsWith(".json"),
-				select: (files, now) => files.filter((f) => now - f.mtime > maxAgeMs),
-			},
-		);
+		await cleanupFiles(networkInfoPath, logger, {
+			label: "network info file",
+			filter: (name) => name.endsWith(".json"),
+			select: (files, now) => files.filter((f) => now - f.mtime > maxAgeMs),
+		});
 	}
 
 	/**
@@ -175,7 +119,8 @@ export class SshProcessMonitor implements vscode.Disposable {
 		maxAgeMs: number,
 		logger: Logger,
 	): Promise<void> {
-		await SshProcessMonitor.cleanupFiles(logDir, "log file", logger, {
+		await cleanupFiles(logDir, logger, {
+			label: "log file",
 			filter: (name) => name.startsWith("coder-ssh") && name.endsWith(".log"),
 			select: (files, now) =>
 				files
@@ -194,10 +139,8 @@ export class SshProcessMonitor implements vscode.Disposable {
 			// Matches the SSH update interval
 			networkPollInterval: options.networkPollInterval ?? 3000,
 		};
-		this.statusBarItem = vscode.window.createStatusBarItem(
-			vscode.StatusBarAlignment.Left,
-			1000,
-		);
+		this.telemetry = new SshTelemetry(options.telemetry);
+		this.statusBarItem = createStatusBarItem("networkStatus");
 		this.reporter = new NetworkStatusReporter(this.statusBarItem);
 	}
 
@@ -249,11 +192,14 @@ export class SshProcessMonitor implements vscode.Disposable {
 		if (this.disposed) {
 			return;
 		}
+		this.telemetry.disposed();
 		this.disposed = true;
-		if (this.pendingTimeout) {
-			clearTimeout(this.pendingTimeout);
-			this.pendingTimeout = undefined;
+		// Unblock all in-flight delay() calls so concurrent loops exit promptly.
+		for (const handle of this.pendingDelays) {
+			clearTimeout(handle.timer);
+			handle.resolve();
 		}
+		this.pendingDelays.clear();
 		this.statusBarItem.dispose();
 		this._onLogFilePathChange.dispose();
 		this._onPidChange.dispose();
@@ -267,10 +213,14 @@ export class SshProcessMonitor implements vscode.Disposable {
 			return;
 		}
 		await new Promise<void>((resolve) => {
-			this.pendingTimeout = setTimeout(() => {
-				this.pendingTimeout = undefined;
-				resolve();
-			}, ms);
+			const handle = {
+				timer: setTimeout(() => {
+					this.pendingDelays.delete(handle);
+					resolve();
+				}, ms),
+				resolve,
+			};
+			this.pendingDelays.add(handle);
 		});
 	}
 
@@ -279,18 +229,33 @@ export class SshProcessMonitor implements vscode.Disposable {
 	 * Starts monitoring when it finds the process through the port.
 	 */
 	private async searchForProcess(): Promise<void> {
+		const pid = await this.telemetry.traceProcessDiscovery(() =>
+			this.discoverSshProcess(),
+		);
+		if (pid === undefined || this.disposed) {
+			return;
+		}
+
+		this.setCurrentPid(pid);
+		this.startMonitoring();
+	}
+
+	private async discoverSshProcess(): Promise<{
+		pid: number | undefined;
+		attempts: number;
+	}> {
 		const { discoveryPollIntervalMs, maxDiscoveryBackoffMs, logger, sshHost } =
 			this.options;
-		let attempt = 0;
+		let attempts = 0;
 		let currentBackoff = discoveryPollIntervalMs;
 		let lastFoundPort: number | undefined;
 
 		while (!this.disposed) {
-			attempt++;
+			attempts++;
 
-			if (attempt === 1 || attempt % 10 === 0) {
+			if (attempts === 1 || attempts % 10 === 0) {
 				logger.debug(
-					`SSH process search attempt ${attempt} for host: ${sshHost}`,
+					`SSH process search attempt ${attempts} for host: ${sshHost}`,
 				);
 			}
 
@@ -312,14 +277,14 @@ export class SshProcessMonitor implements vscode.Disposable {
 			}
 
 			if (pid !== undefined) {
-				this.setCurrentPid(pid);
-				this.startMonitoring();
-				return;
+				return { pid, attempts };
 			}
 
 			await this.delay(currentBackoff);
 			currentBackoff = Math.min(currentBackoff * 2, maxDiscoveryBackoffMs);
 		}
+
+		return { pid: undefined, attempts };
 	}
 
 	/**
@@ -375,16 +340,24 @@ export class SshProcessMonitor implements vscode.Disposable {
 		this.currentPid = pid;
 
 		if (previousPid === undefined) {
+			this.telemetry.processStarted();
 			this.options.logger.info(`SSH connection established (PID: ${pid})`);
 			this._onPidChange.fire(pid);
-		} else if (previousPid !== pid) {
-			this.options.logger.info(
-				`SSH process changed from ${previousPid} to ${pid}`,
-			);
-			this.logFilePath = undefined;
-			this._onLogFilePathChange.fire(undefined);
-			this._onPidChange.fire(pid);
+			return;
 		}
+
+		if (previousPid === pid) {
+			this.telemetry.processRecovered();
+			return;
+		}
+
+		this.telemetry.processReplaced();
+		this.options.logger.info(
+			`SSH process changed from ${previousPid} to ${pid}`,
+		);
+		this.logFilePath = undefined;
+		this._onLogFilePathChange.fire(undefined);
+		this._onPidChange.fire(pid);
 	}
 
 	/**
@@ -476,6 +449,7 @@ export class SshProcessMonitor implements vscode.Disposable {
 					const network = JSON.parse(content) as NetworkInfo;
 					const isStale = ageMs > networkPollInterval * 2;
 					this.reporter.update(network, isStale);
+					this.telemetry.networkSampled(network);
 				}
 			} catch (error) {
 				readFailures++;
@@ -488,6 +462,10 @@ export class SshProcessMonitor implements vscode.Disposable {
 			}
 
 			if (searchReason !== undefined) {
+				const lossCause: ProcessLossCause =
+					readFailures >= maxReadFailures
+						? "missing_network_info"
+						: "stale_network_info";
 				const timeSinceLastSearch = Date.now() - this.lastStaleSearchTime;
 				if (timeSinceLastSearch < staleThreshold) {
 					await this.delay(staleThreshold - timeSinceLastSearch);
@@ -495,6 +473,7 @@ export class SshProcessMonitor implements vscode.Disposable {
 				}
 
 				logger.debug(`${searchReason}, searching for new SSH process`);
+				this.telemetry.processLost(lossCause);
 				// searchForProcess will update PID if a different process is found
 				this.lastStaleSearchTime = Date.now();
 				await this.searchForProcess();
@@ -508,7 +487,7 @@ export class SshProcessMonitor implements vscode.Disposable {
 
 /**
  * Finds the Remote SSH extension's log file path.
- * Tries extension-specific folder first (Cursor, Windsurf, Antigravity),
+ * Tries extension-specific folder first (Cursor, Devin Desktop / Windsurf, Antigravity),
  * then output_logging_ fallback (MS VS Code).
  */
 async function findRemoteSshLogPath(
@@ -518,7 +497,7 @@ async function findRemoteSshLogPath(
 ): Promise<string | undefined> {
 	const logsParentDir = path.dirname(codeLogDir);
 
-	// Try extension-specific folder (for VS Code clones like Cursor, Windsurf)
+	// Try extension-specific folder (for VS Code clones like Cursor, Devin Desktop)
 	try {
 		const extensionLogDir = path.join(logsParentDir, extensionId);
 		const remoteSshLog = await findSshLogInDir(extensionLogDir);
@@ -536,7 +515,7 @@ async function findRemoteSshLogPath(
 	try {
 		const dirs = await fs.readdir(logsParentDir);
 		const outputDirs = dirs
-			.filter((d) => d.startsWith("output_logging_"))
+			.filter(isOutputLoggingDir)
 			.sort((a, b) => a.localeCompare(b))
 			.reverse();
 
@@ -563,6 +542,39 @@ async function findRemoteSshLogPath(
 
 async function findSshLogInDir(dirPath: string): Promise<string | undefined> {
 	const files = await fs.readdir(dirPath);
-	const remoteSshLog = files.find((f) => f.includes("Remote - SSH"));
+	const remoteSshLog = files.find(isSharedChannelRemoteSshLog);
 	return remoteSshLog ? path.join(dirPath, remoteSshLog) : undefined;
+}
+
+// Regex patterns to find the SSH port from Remote SSH extension logs.
+// `ms-vscode-remote.remote-ssh`: `-> socksPort <port> ->` or `between local port <port>`
+// `codeium.windsurf-remote-openssh`, `jeanp413.open-remote-ssh`, `google.antigravity-remote-openssh`: `=> <port>(socks) =>`
+// `anysphere.remote-ssh`: `Socks port: <port>`
+const RemoteSSHLogPortRegex =
+	/(?:-> socksPort (\d+) ->|between local port (\d+)|=> (\d+)\(socks\) =>|Socks port: (\d+))/g;
+
+/**
+ * Given the contents of a Remote - SSH log file, find the most recent port
+ * number used by the SSH process. This is typically the socks port, but the
+ * local port works too.
+ *
+ * Returns null if no port is found.
+ */
+export function findPort(text: string): number | null {
+	const allMatches = [...text.matchAll(RemoteSSHLogPortRegex)];
+	if (allMatches.length === 0) {
+		return null;
+	}
+
+	// Get the last match, which is the most recent port.
+	const lastMatch = allMatches[allMatches.length - 1];
+	// Each capture group corresponds to a different Remote SSH extension log format:
+	// [0] full match, [1] and [2] ms-vscode-remote.remote-ssh,
+	// [3] devin/windsurf/open-remote-ssh/antigravity, [4] anysphere.remote-ssh
+	const portStr = lastMatch[1] || lastMatch[2] || lastMatch[3] || lastMatch[4];
+	if (!portStr) {
+		return null;
+	}
+
+	return Number.parseInt(portStr);
 }

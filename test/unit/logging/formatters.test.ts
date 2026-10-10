@@ -7,6 +7,8 @@ import {
 	formatSize,
 	formatTime,
 	formatUri,
+	safeStringify,
+	sizeOf,
 } from "@/logging/formatters";
 
 describe("Logging formatters", () => {
@@ -71,14 +73,34 @@ describe("Logging formatters", () => {
 			expect(result).toContain("accept: text/html");
 		});
 
-		it("redacts sensitive headers", () => {
-			const sensitiveHeaders = ["Coder-Session-Token", "Proxy-Authorization"];
+		it("redacts sensitive headers regardless of casing", () => {
+			const sensitiveHeaders = [
+				"authorization",
+				"AUTHORIZATION",
+				"Coder-Session-Token",
+				"coder-session-token",
+				"cookie",
+				"set-cookie",
+				"SET-COOKIE",
+				"X-Api-Key",
+				"Proxy-Authorization",
+			];
 
 			sensitiveHeaders.forEach((header) => {
 				const result = formatHeaders({ [header]: "secret-value" });
 				expect(result).toContain(`${header}: <redacted>`);
 				expect(result).not.toContain("secret-value");
 			});
+		});
+
+		it("redacts extra header names case-insensitively", () => {
+			const result = formatHeaders(
+				{ "X-Custom-Auth": "secret-value", accept: "text/html" },
+				["x-custom-auth"],
+			);
+			expect(result).toContain("X-Custom-Auth: <redacted>");
+			expect(result).not.toContain("secret-value");
+			expect(result).toContain("accept: text/html");
 		});
 
 		it("returns placeholder for empty headers", () => {
@@ -118,5 +140,155 @@ describe("Logging formatters", () => {
 				expect(formatBody(value)).toContain("no body");
 			});
 		});
+
+		it("redacts sensitive fields in objects", () => {
+			const result = formatBody({
+				access_token: "secret-access",
+				refresh_token: "secret-refresh",
+				registration_access_token: "secret-registration",
+				client_secret: "secret-client",
+				code: "secret-code",
+				code_verifier: "secret-verifier",
+				id_token: "secret-id",
+				password: "secret-password",
+				token: "secret-token",
+				token_type: "bearer",
+			});
+			expect(result).toContain("access_token: '<redacted>'");
+			expect(result).toContain("registration_access_token: '<redacted>'");
+			expect(result).toContain("token_type: 'bearer'");
+			expect(result).not.toContain("secret-");
+		});
+
+		it("redacts sensitive fields in nested objects and arrays", () => {
+			const result = formatBody({
+				data: { session: { TOKEN: "secret-value" } },
+				items: [{ password: "secret-value" }],
+			});
+			expect(result).toContain("TOKEN: '<redacted>'");
+			expect(result).toContain("password: '<redacted>'");
+			expect(result).not.toContain("secret-value");
+		});
+
+		it("redacts sensitive fields in URLSearchParams", () => {
+			const params = new URLSearchParams({
+				grant_type: "refresh_token",
+				refresh_token: "secret-value",
+			});
+			const result = formatBody(params);
+			expect(result).toContain("refresh_token");
+			expect(result).toContain("<redacted>");
+			expect(result).not.toContain("secret-value");
+		});
+
+		it("redacts sensitive fields in serialized bodies", () => {
+			const json = formatBody(
+				JSON.stringify({ access_token: "secret-value", expires_in: 3600 }),
+			);
+			expect(json).toContain("expires_in");
+			expect(json).not.toContain("secret-value");
+
+			const form = formatBody(
+				"grant_type=authorization_code&code=secret-value",
+			);
+			expect(form).toContain("grant_type");
+			expect(form).not.toContain("secret-value");
+		});
+
+		it("leaves non-sensitive strings unchanged", () => {
+			expect(formatBody("plain response text")).toContain(
+				"plain response text",
+			);
+			expect(formatBody("a=b&c=d")).toContain("a=b&c=d");
+		});
+	});
+});
+
+describe("sizeOf", () => {
+	type SizeOfTestCase = [data: unknown, bytes: number | undefined];
+	it.each<SizeOfTestCase>([
+		// Primitives return a fixed value
+		[null, 0],
+		[undefined, 0],
+		[42, 8],
+		[3.14, 8],
+		[false, 4],
+		// Strings
+		["hello", 5],
+		["✓", 3],
+		["unicode: ✓", 12],
+		// Buffers
+		[Buffer.from("test"), 4],
+		[BigInt(12345), 5],
+		[BigInt(0), 1],
+		[Buffer.alloc(100), 100],
+		[Buffer.from([]), 0],
+		// Typed-arrays
+		[new ArrayBuffer(50), 50],
+		[new Uint8Array([1, 2, 3, 4]), 4],
+		[new Int32Array([1, 2, 3]), 12],
+		[new Float64Array([1.0, 2.0]), 16],
+		// Objects/untyped-arrays return undefined
+		[{ size: 1024 }, 1024],
+		[{ size: 0 }, 0],
+		[{ size: "not a number" }, undefined],
+		[[], undefined],
+		[[1, 2, 3], undefined],
+		[["a", "b", "c"], undefined],
+		[{}, undefined],
+		[{ foo: "bar" }, undefined],
+		[{ nested: { value: 123 } }, undefined],
+	])("returns size for %s", (data: unknown, bytes: number | undefined) => {
+		expect(sizeOf(data)).toBe(bytes);
+	});
+
+	it("handles circular references safely", () => {
+		const circular: Record<string, unknown> = { a: 1 };
+		circular.self = circular;
+		expect(sizeOf(circular)).toBeUndefined();
+
+		const arr: unknown[] = [1, 2, 3];
+		arr.push(arr);
+		expect(sizeOf(arr)).toBeUndefined();
+	});
+});
+
+describe("safeStringify", () => {
+	it("formats various data types", () => {
+		expect(safeStringify({ key: "value" })).toContain("key: 'value'");
+		expect(safeStringify("plain text")).toContain("plain text");
+		expect(safeStringify([1, 2, 3])).toContain("1");
+		expect(safeStringify(123)).toContain("123");
+		expect(safeStringify(true)).toContain("true");
+	});
+
+	it("handles circular references safely", () => {
+		const circular: Record<string, unknown> = { a: 1 };
+		circular.self = circular;
+		const result = safeStringify(circular);
+		expect(result).toBeTruthy();
+		expect(result).toContain("a: 1");
+	});
+
+	it("handles deep nesting", () => {
+		const deep = {
+			level1: { level2: { level3: { level4: { value: "deep" } } } },
+		};
+		const result = safeStringify(deep);
+		expect(result).toContain("level4: { value: 'deep' }");
+	});
+
+	it("bounds output size for large inputs", () => {
+		const longString = safeStringify("a".repeat(50_000));
+		expect(longString?.length).toBeLessThan(20_000);
+
+		const bigArray = safeStringify(Array.from({ length: 10_000 }, (_, i) => i));
+		expect(bigArray).toContain("more items");
+
+		let nested: Record<string, unknown> = { value: "bottom" };
+		for (let i = 0; i < 30; i++) {
+			nested = { child: nested };
+		}
+		expect(safeStringify(nested)).not.toContain("bottom");
 	});
 });

@@ -1,9 +1,18 @@
 import { beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import * as vscode from "vscode";
 
+import { HttpStatusCode } from "@/api/httpStatusCode";
 import { streamAgentLogs, streamBuildLogs } from "@/api/workspace";
 import { TasksPanelProvider } from "@/webviews/tasks/tasksPanelProvider";
 
+import {
+	logEntry,
+	preset,
+	task,
+	taskState,
+	template,
+	workspace,
+} from "@repo/mocks";
 import {
 	TasksApi,
 	defineRequest,
@@ -12,19 +21,14 @@ import {
 	type TaskIdParams,
 } from "@repo/shared";
 
-import {
-	logEntry,
-	preset,
-	task,
-	taskState,
-	template,
-} from "../../../mocks/tasks";
+import { createTestCoderApi } from "../../../mocks/coderApi";
 import {
 	createAxiosError,
 	createMockLogger,
+	createMockWebviewView,
+	MockConfigurationProvider,
 	MockUserInteraction,
 } from "../../../mocks/testHelpers";
-import { workspace } from "../../../mocks/workspace";
 
 import type {
 	ProvisionerJobLog,
@@ -82,23 +86,28 @@ type TasksPanelClient = Pick<
 
 type MockClient = { [K in keyof TasksPanelClient]: Mock<TasksPanelClient[K]> };
 
-function createClient(baseUrl = "https://coder.example.com"): MockClient {
-	return {
-		getTasks: vi.fn().mockResolvedValue([]),
-		getTask: vi.fn(),
-		getTaskLogs: vi.fn().mockResolvedValue({ logs: [] }),
-		createTask: vi.fn(),
-		deleteTask: vi.fn().mockResolvedValue(undefined),
-		getTemplates: vi.fn().mockResolvedValue([]),
-		getTemplateVersionPresets: vi.fn().mockResolvedValue([]),
-		startWorkspace: vi.fn().mockResolvedValue(undefined),
-		stopWorkspace: vi.fn().mockResolvedValue(undefined),
-		pauseTask: vi.fn().mockResolvedValue(undefined),
-		resumeTask: vi.fn().mockResolvedValue(undefined),
-		sendTaskInput: vi.fn().mockResolvedValue(undefined),
-		getHost: vi.fn().mockReturnValue(baseUrl),
-		getWorkspace: vi.fn().mockResolvedValue(workspace()),
-	};
+function createClient(
+	baseUrl = "https://coder.example.com",
+): CoderApi & MockClient {
+	return createTestCoderApi<MockClient>({
+		baseUrl,
+		overrides: {
+			getTasks: vi.fn().mockResolvedValue([]),
+			getTask: vi.fn(),
+			getTaskLogs: vi.fn().mockResolvedValue({ logs: [] }),
+			createTask: vi.fn(),
+			deleteTask: vi.fn().mockResolvedValue(undefined),
+			getTemplates: vi.fn().mockResolvedValue([]),
+			getTemplateVersionPresets: vi.fn().mockResolvedValue([]),
+			startWorkspace: vi.fn().mockResolvedValue(undefined),
+			stopWorkspace: vi.fn().mockResolvedValue(undefined),
+			pauseTask: vi.fn().mockResolvedValue(undefined),
+			resumeTask: vi.fn().mockResolvedValue(undefined),
+			sendTaskInput: vi.fn().mockResolvedValue(undefined),
+			getHost: vi.fn().mockReturnValue(baseUrl),
+			getWorkspace: vi.fn().mockResolvedValue(workspace()),
+		},
+	});
 }
 
 interface Harness {
@@ -123,38 +132,14 @@ function createHarness(): Harness {
 	const client = createClient();
 	const panel = new TasksPanelProvider(
 		vscode.Uri.file("/test/extension"),
-		// Cast needed: mock only implements the subset of CoderApi methods used by TasksPanelProvider
-		client as unknown as CoderApi,
+		client,
 		createMockLogger(),
 	);
 
-	const posted: unknown[] = [];
-	let handler: ((msg: unknown) => void) | null = null;
-
-	const webview: vscode.WebviewView = {
-		viewType: "coder.tasksPanel",
-		webview: {
-			options: { enableScripts: false, localResourceRoots: [] },
-			html: "",
-			cspSource: "",
-			postMessage: vi.fn((msg: unknown) => {
-				posted.push(msg);
-				return Promise.resolve(true);
-			}),
-			onDidReceiveMessage: vi.fn((h) => {
-				handler = h;
-				return { dispose: vi.fn() };
-			}),
-			asWebviewUri: vi.fn((uri: vscode.Uri) => uri),
-		},
-		visible: true,
-		show: vi.fn(),
-		onDidChangeVisibility: vi.fn(() => ({ dispose: vi.fn() })),
-		onDidDispose: vi.fn(() => ({ dispose: vi.fn() })),
-	};
+	const { view, hooks } = createMockWebviewView("coder.tasksPanel");
 
 	panel.resolveWebviewView(
-		webview,
+		view,
 		{} as vscode.WebviewViewResolveContext,
 		{} as vscode.CancellationToken,
 	);
@@ -163,19 +148,19 @@ function createHarness(): Harness {
 		panel,
 		client,
 		ui,
-		messages: () => [...posted],
+		messages: () => [...hooks.postedMessages],
 		request: async <P, R>(
 			def: RequestDef<P, R>,
 			...args: P extends void ? [] : [params: P]
 		) => {
 			const params = args[0];
 			const requestId = `req-${Date.now()}-${Math.random()}`;
-			handler?.({ requestId, method: def.method, params });
+			hooks.sendFromWebview({ requestId, method: def.method, params });
 
 			await vi.waitFor(
 				() => {
 					if (
-						!posted.some(
+						!hooks.postedMessages.some(
 							(m) => (m as { requestId?: string }).requestId === requestId,
 						)
 					) {
@@ -185,7 +170,7 @@ function createHarness(): Harness {
 				{ timeout: 1000 },
 			);
 
-			return posted.find(
+			return hooks.postedMessages.find(
 				(m) => (m as { requestId?: string }).requestId === requestId,
 			) as { success: boolean; data?: R; error?: string };
 		},
@@ -193,16 +178,20 @@ function createHarness(): Harness {
 			def: CommandDef<P>,
 			...args: P extends void ? [] : [params: P]
 		) => {
-			handler?.({ method: def.method, params: args[0] });
+			hooks.sendFromWebview({ method: def.method, params: args[0] });
 			await new Promise((r) => setTimeout(r, 10));
 		},
 	};
 }
 
 describe("TasksPanelProvider", () => {
+	let configurationProvider: MockConfigurationProvider;
+
 	beforeEach(() => {
 		// Reset shared vscode mocks between tests
 		vi.resetAllMocks();
+
+		configurationProvider = new MockConfigurationProvider();
 	});
 
 	describe("getTasks", () => {
@@ -221,7 +210,9 @@ describe("TasksPanelProvider", () => {
 
 		it("returns null on 404", async () => {
 			const h = createHarness();
-			h.client.getTasks.mockRejectedValue(createAxiosError(404, "Not found"));
+			h.client.getTasks.mockRejectedValue(
+				createAxiosError(HttpStatusCode.NOT_FOUND, "Not found"),
+			);
 
 			const res = await h.request(TasksApi.getTasks);
 
@@ -282,7 +273,7 @@ describe("TasksPanelProvider", () => {
 		it("returns null on 404", async () => {
 			const h = createHarness();
 			h.client.getTemplates.mockRejectedValue(
-				createAxiosError(404, "Not found"),
+				createAxiosError(HttpStatusCode.NOT_FOUND, "Not found"),
 			);
 
 			const res = await h.request(TasksApi.getTemplates);
@@ -340,7 +331,9 @@ describe("TasksPanelProvider", () => {
 		it("returns logsStatus not_available on 409", async () => {
 			const h = createHarness();
 			h.client.getTask.mockResolvedValue(task());
-			h.client.getTaskLogs.mockRejectedValue(createAxiosError(409, "Conflict"));
+			h.client.getTaskLogs.mockRejectedValue(
+				createAxiosError(HttpStatusCode.CONFLICT, "Conflict"),
+			);
 
 			const res = await h.request(TasksApi.getTaskDetails, {
 				taskId: "task-1",
@@ -472,7 +465,9 @@ describe("TasksPanelProvider", () => {
 
 		it("pauseTask falls back to stopWorkspace on 404", async () => {
 			const h = createHarness();
-			h.client.pauseTask.mockRejectedValue(createAxiosError(404, "Not found"));
+			h.client.pauseTask.mockRejectedValue(
+				createAxiosError(HttpStatusCode.NOT_FOUND, "Not found"),
+			);
 			h.client.getTask.mockResolvedValue(task({ workspace_id: "ws-1" }));
 
 			const res = await h.request(TasksApi.pauseTask, {
@@ -486,7 +481,9 @@ describe("TasksPanelProvider", () => {
 
 		it("resumeTask falls back to startWorkspace on 404", async () => {
 			const h = createHarness();
-			h.client.resumeTask.mockRejectedValue(createAxiosError(404, "Not found"));
+			h.client.resumeTask.mockRejectedValue(
+				createAxiosError(HttpStatusCode.NOT_FOUND, "Not found"),
+			);
 			h.client.getTask.mockResolvedValue(
 				task({ workspace_id: "ws-1", template_version_id: "tv-1" }),
 			);
@@ -502,7 +499,9 @@ describe("TasksPanelProvider", () => {
 
 		it("caches legacy fallback after first 404", async () => {
 			const h = createHarness();
-			h.client.pauseTask.mockRejectedValue(createAxiosError(404, "Not found"));
+			h.client.pauseTask.mockRejectedValue(
+				createAxiosError(HttpStatusCode.NOT_FOUND, "Not found"),
+			);
 			h.client.getTask.mockResolvedValue(task({ workspace_id: "ws-1" }));
 
 			await h.request(TasksApi.pauseTask, {
@@ -523,7 +522,10 @@ describe("TasksPanelProvider", () => {
 		it("propagates non-404 errors without fallback", async () => {
 			const h = createHarness();
 			h.client.pauseTask.mockRejectedValue(
-				createAxiosError(500, "Internal server error"),
+				createAxiosError(
+					HttpStatusCode.INTERNAL_SERVER_ERROR,
+					"Internal server error",
+				),
 			);
 
 			const res = await h.request(TasksApi.pauseTask, {
@@ -537,7 +539,9 @@ describe("TasksPanelProvider", () => {
 
 		it("legacy pause fails when task has no workspace", async () => {
 			const h = createHarness();
-			h.client.pauseTask.mockRejectedValue(createAxiosError(404, "Not found"));
+			h.client.pauseTask.mockRejectedValue(
+				createAxiosError(HttpStatusCode.NOT_FOUND, "Not found"),
+			);
 			h.client.getTask.mockResolvedValue(task({ workspace_id: null }));
 
 			const res = await h.request(TasksApi.pauseTask, {
@@ -598,13 +602,13 @@ describe("TasksPanelProvider", () => {
 			{
 				name: "409 conflict (task pending/paused)",
 				taskOverrides: { status: "active", current_state: taskState("idle") },
-				sendError: createAxiosError(409, "Conflict"),
+				sendError: createAxiosError(HttpStatusCode.CONFLICT, "Conflict"),
 				expectedError: "Agent is not ready for messages",
 			},
 			{
 				name: "400 bad request (task error/unknown)",
 				taskOverrides: { status: "active", current_state: taskState("idle") },
-				sendError: createAxiosError(400, "Bad Request"),
+				sendError: createAxiosError(HttpStatusCode.BAD_REQUEST, "Bad Request"),
 				expectedError: "Agent is not ready for messages",
 			},
 		])(
@@ -678,6 +682,46 @@ describe("TasksPanelProvider", () => {
 
 			expect(vscode.env.openExternal).not.toHaveBeenCalled();
 		});
+
+		it("viewInCoder uses the alternative web URL when configured", async () => {
+			configurationProvider.set(
+				"coder.alternativeWebUrl",
+				"https://coder.example.com:443",
+			);
+			const h = createHarness();
+			h.client.getTask.mockResolvedValue(
+				task({ id: "task-1", owner_name: "alice" }),
+			);
+
+			await h.command(TasksApi.viewInCoder, { taskId: "task-1" });
+
+			expect(vscode.env.openExternal).toHaveBeenCalledWith(
+				vscode.Uri.parse("https://coder.example.com:443/tasks/alice/task-1"),
+			);
+		});
+
+		it("viewLogs uses the alternative web URL when configured", async () => {
+			configurationProvider.set(
+				"coder.alternativeWebUrl",
+				"https://coder.example.com:443",
+			);
+			const h = createHarness();
+			h.client.getTask.mockResolvedValue(
+				task({
+					owner_name: "alice",
+					workspace_name: "my-ws",
+					workspace_build_number: 42,
+				}),
+			);
+
+			await h.command(TasksApi.viewLogs, { taskId: "task-1" });
+
+			expect(vscode.env.openExternal).toHaveBeenCalledWith(
+				vscode.Uri.parse(
+					"https://coder.example.com:443/@alice/my-ws/builds/42",
+				),
+			);
+		});
 	});
 
 	describe("downloadLogs", () => {
@@ -728,7 +772,10 @@ describe("TasksPanelProvider", () => {
 		it("propagates server errors instead of masking them", async () => {
 			const h = createHarness();
 			h.client.getTaskLogs.mockRejectedValue(
-				createAxiosError(500, "Internal server error"),
+				createAxiosError(
+					HttpStatusCode.INTERNAL_SERVER_ERROR,
+					"Internal server error",
+				),
 			);
 
 			const res = await h.request(TasksApi.downloadLogs, {
@@ -788,7 +835,7 @@ describe("TasksPanelProvider", () => {
 			const res = await h.request(defineRequest("unknownMethod"));
 
 			expect(res.success).toBe(false);
-			expect(res.error).toContain("Unknown method");
+			expect(res.error).toContain("Unknown request");
 		});
 
 		it("createTask succeeds even when refreshing the task list fails", async () => {

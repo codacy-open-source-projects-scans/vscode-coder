@@ -1,18 +1,29 @@
 import type * as semver from "semver";
 
-export interface FeatureSet {
-	vscodessh: boolean;
+/** Capabilities keyed to the Coder CLI version. */
+export interface CliFeatureSet {
+	cliLogin: boolean;
 	proxyLogDirectory: boolean;
 	wildcardSSH: boolean;
 	buildReason: boolean;
 	cliUpdate: boolean;
 	keyringAuth: boolean;
-	keyringTokenRead: boolean;
+	tokenRead: boolean;
 	supportBundle: boolean;
+	supportBundleWorkspaceFiles: boolean;
+	allowRedirects: boolean;
+	customSessionAppNames: boolean;
+}
+
+/** Capabilities keyed to the Coder server (REST API) version. */
+export interface ServerFeatureSet {
+	tasks: boolean;
+	onSuccessBuild: boolean;
+	customSessionAppNames: boolean;
 }
 
 /**
- * True when the CLI version is at least `minVersion`, or is a dev build.
+ * True when the version is at least `minVersion`, or is a dev build.
  * Returns false for null (unknown) versions.
  */
 function versionAtLeast(
@@ -25,20 +36,12 @@ function versionAtLeast(
 	return version.compare(minVersion) >= 0 || version.prerelease[0] === "devel";
 }
 
-/**
- * Builds and returns a FeatureSet object for a given coder version.
- */
-export function featureSetForVersion(
-	version: semver.SemVer | null,
-): FeatureSet {
+/** Capabilities of the given CLI version. */
+export function cliFeatureSet(version: semver.SemVer | null): CliFeatureSet {
 	return {
-		vscodessh: !(
-			version?.major === 0 &&
-			version?.minor <= 14 &&
-			version?.patch < 1 &&
-			version?.prerelease.length === 0
-		),
-
+		// `coder login --use-token-as-session` to write a token (file or keyring).
+		// The extension relies on this, so 0.25.0 is the minimum supported version.
+		cliLogin: versionAtLeast(version, "0.25.0"),
 		// --log-dir flag for proxy logs; vscodessh fails if unsupported
 		proxyLogDirectory: versionAtLeast(version, "2.4.0"),
 		// Wildcard SSH host matching
@@ -49,9 +52,28 @@ export function featureSetForVersion(
 		cliUpdate: versionAtLeast(version, "2.24.0"),
 		// Keyring-backed token storage via `coder login`
 		keyringAuth: versionAtLeast(version, "2.29.0"),
-		// `coder login token` for reading tokens from the keyring
-		keyringTokenRead: versionAtLeast(version, "2.31.0"),
+		// `coder login token`; from 2.32 file mode also checks the URL it stored.
+		tokenRead: versionAtLeast(version, "2.32.0"),
 		// `coder support bundle` (officially released/unhidden in 2.10.0)
 		supportBundle: versionAtLeast(version, "2.10.0"),
+		// --workspace-file flag for `coder support bundle`
+		supportBundleWorkspaceFiles: versionAtLeast(version, "2.36.0"),
+		// --allow-redirects; from 2.38 the CLI otherwise errors on a redirected URL.
+		allowRedirects: versionAtLeast(version, "2.38.0"),
+		customSessionAppNames: versionAtLeast(version, "2.38.0"),
+	};
+}
+
+/** Capabilities of the given deployment version. */
+export function serverFeatureSet(
+	version: semver.SemVer | null,
+): ServerFeatureSet {
+	return {
+		// `/api/v2/tasks`, stable from 2.29 until the 2.35 deprecation
+		tasks:
+			versionAtLeast(version, "2.29.0") && !versionAtLeast(version, "2.35.0"),
+		// `on_success` on a stop build, which queues the start in one request
+		onSuccessBuild: versionAtLeast(version, "2.36.0"),
+		customSessionAppNames: versionAtLeast(version, "2.38.0"),
 	};
 }

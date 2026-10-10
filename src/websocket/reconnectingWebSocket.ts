@@ -1,21 +1,33 @@
+import { HttpStatusCode } from "../api/httpStatusCode";
 import { ClientCertificateError } from "../error/clientCertificateError";
-import { toError } from "../error/errorUtils";
+import { toError } from "../error/normalize";
+import {
+	WebSocketTelemetry,
+	type ConnectionDropCause,
+	type ConnectionStateReason,
+} from "../instrumentation/websocket";
 
 import {
 	WebSocketCloseCode,
-	NORMAL_CLOSURE_CODES,
 	UNRECOVERABLE_WS_CLOSE_CODES,
 	UNRECOVERABLE_HTTP_CODES,
+	handshakeStatus,
 } from "./codes";
 
 import type { WebSocketEventType } from "coder/site/src/utils/OneWayWebSocket";
 
 import type { Logger } from "../logging/logger";
+import type { TelemetryReporter } from "../telemetry/reporter";
 
 import type {
+	CloseEvent,
 	EventHandler,
 	UnidirectionalStream,
 } from "./eventStreamConnection";
+
+function toCloseEventError(event: CloseEvent): Error {
+	return new Error(`WebSocket closed with code ${event.code}: ${event.reason}`);
+}
 
 /**
  * Connection states for the ReconnectingWebSocket state machine.
@@ -99,10 +111,19 @@ function reduceState(
 
 export type SocketFactory<TData> = () => Promise<UnidirectionalStream<TData>>;
 
+/**
+ * Consecutive failed reconnect attempts before the buffer is flushed once and
+ * the server is treated as unreachable.
+ */
+const MAX_RECONNECT_FAILURES_BEFORE_FLUSH = 6;
+
 export interface ReconnectingWebSocketOptions {
 	initialBackoffMs?: number;
 	maxBackoffMs?: number;
 	jitterFactor?: number;
+	telemetry: TelemetryReporter;
+	/** API route (pathname) of the socket, used to seed logging before the first connect resolves. */
+	route: string;
 	/** Callback invoked when a refreshable certificate error is detected. Returns true if refresh succeeded. */
 	onCertificateRefreshNeeded: () => Promise<boolean>;
 }
@@ -112,7 +133,10 @@ export class ReconnectingWebSocket<
 > implements UnidirectionalStream<TData> {
 	readonly #socketFactory: SocketFactory<TData>;
 	readonly #logger: Logger;
-	readonly #options: Required<ReconnectingWebSocketOptions>;
+	readonly #telemetry: WebSocketTelemetry;
+	readonly #options: Required<
+		Omit<ReconnectingWebSocketOptions, "telemetry" | "route">
+	>;
 	readonly #eventHandlers: {
 		[K in WebSocketEventType]: Set<EventHandler<TData, K>>;
 	} = {
@@ -123,9 +147,13 @@ export class ReconnectingWebSocket<
 	};
 
 	#currentSocket: UnidirectionalStream<TData> | null = null;
-	#lastRoute = "unknown"; // Cached route for logging when socket is closed
+	// Route to log while no socket is connected. Kept because the live URL
+	// diverges from the seeded route after an SSE fallback and after a redirect
+	// (followRedirects), so it is not simply the seeded value.
+	#lastRoute: string;
 	#backoffMs: number;
 	#reconnectTimeoutId: NodeJS.Timeout | null = null;
+	#consecutiveConnectFailures = 0;
 	#state: ConnectionState = ConnectionState.IDLE;
 	#certRefreshAttempted = false; // Tracks if cert refresh was already attempted this connection cycle
 	readonly #onDispose?: () => void;
@@ -133,19 +161,21 @@ export class ReconnectingWebSocket<
 	/**
 	 * Dispatch an action to transition state. Returns true if transition is allowed.
 	 */
-	#dispatch(action: StateAction): boolean {
-		const newState = reduceState(this.#state, action);
-		if (newState === this.#state) {
+	#dispatch(action: StateAction, reason: ConnectionStateReason): boolean {
+		const previousState = this.#state;
+		const newState = reduceState(previousState, action);
+		if (newState === previousState) {
 			// Allow CONNECT from CONNECTING as a "restart" operation
 			if (
 				action.type === "CONNECT" &&
-				this.#state === ConnectionState.CONNECTING
+				previousState === ConnectionState.CONNECTING
 			) {
 				return true;
 			}
 			return false;
 		}
 		this.#state = newState;
+		this.#telemetry.stateTransition(previousState, newState, reason);
 		return true;
 	}
 
@@ -157,12 +187,14 @@ export class ReconnectingWebSocket<
 	) {
 		this.#socketFactory = socketFactory;
 		this.#logger = logger;
+		this.#telemetry = new WebSocketTelemetry(options.telemetry);
 		this.#options = {
 			initialBackoffMs: options.initialBackoffMs ?? 250,
 			maxBackoffMs: options.maxBackoffMs ?? 30000,
 			jitterFactor: options.jitterFactor ?? 0.1,
 			onCertificateRefreshNeeded: options.onCertificateRefreshNeeded,
 		};
+		this.#lastRoute = options.route;
 		this.#backoffMs = this.#options.initialBackoffMs;
 		this.#onDispose = onDispose;
 	}
@@ -180,8 +212,7 @@ export class ReconnectingWebSocket<
 			onDispose,
 		);
 
-		// connect() handles all errors internally
-		await instance.connect();
+		await instance.connect("initial_connect");
 		return instance;
 	}
 
@@ -197,8 +228,9 @@ export class ReconnectingWebSocket<
 	}
 
 	/**
-	 * Extract the route (pathname + search) from the current socket URL for logging.
-	 * Falls back to the last known route when the socket is closed.
+	 * Route (pathname only) of the current socket, for logging. The query
+	 * string is dropped so connection tokens carried there never reach logs or
+	 * telemetry. Falls back to the last known route when the socket is closed.
 	 */
 	get #route(): string {
 		const socketUrl = this.#currentSocket?.url;
@@ -206,7 +238,7 @@ export class ReconnectingWebSocket<
 			return this.#lastRoute;
 		}
 		const url = new URL(socketUrl);
-		return url.pathname + url.search;
+		return url.pathname;
 	}
 
 	public addEventListener<TEvent extends WebSocketEventType>(
@@ -228,13 +260,22 @@ export class ReconnectingWebSocket<
 	 * Resumes the socket if previously disconnected via disconnect().
 	 */
 	public reconnect(): void {
+		this.#reconnectInternal("manual_reconnect");
+	}
+
+	#reconnectInternal(reason: ConnectionStateReason): void {
 		if (this.#state === ConnectionState.DISPOSED) {
 			return;
+		}
+
+		if (this.#state !== ConnectionState.IDLE) {
+			this.#telemetry.reconnectStarted(reason);
 		}
 
 		if (this.#state === ConnectionState.DISCONNECTED) {
 			this.#backoffMs = this.#options.initialBackoffMs;
 			this.#certRefreshAttempted = false; // User-initiated reconnect, allow retry
+			this.#consecutiveConnectFailures = 0;
 		}
 
 		if (this.#reconnectTimeoutId !== null) {
@@ -242,18 +283,42 @@ export class ReconnectingWebSocket<
 			this.#reconnectTimeoutId = null;
 		}
 
-		// connect() handles all errors internally
-		void this.connect();
+		void this.connect(reason);
 	}
 
 	/**
 	 * Temporarily disconnect the socket. Can be resumed via reconnect().
 	 */
 	public disconnect(code?: number, reason?: string): void {
-		if (!this.#dispatch({ type: "DISCONNECT" })) {
+		this.disconnectWithReason("disconnect", "manual_disconnect", {
+			code,
+			closeReason: reason,
+		});
+	}
+
+	private disconnectWithReason(
+		reason: ConnectionStateReason,
+		cause: ConnectionDropCause,
+		options: {
+			code?: number;
+			closeReason?: string;
+			error?: unknown;
+			/** Flush the connection log buffer: a genuine, surfaced failure. */
+			failure?: boolean;
+		} = {},
+	): void {
+		if (!this.#dispatch({ type: "DISCONNECT" }, reason)) {
 			return;
 		}
-		this.clearCurrentSocket(code, reason);
+		this.#telemetry.terminated(reason, {
+			cause,
+			code: options.code,
+			error: options.error,
+		});
+		this.clearCurrentSocket(options.code, options.closeReason);
+		if (options.failure) {
+			this.#logger.flush(`${reason} ${this.#route}`);
+		}
 	}
 
 	public close(code?: number, reason?: string): void {
@@ -273,18 +338,17 @@ export class ReconnectingWebSocket<
 		this.dispose(code, reason);
 	}
 
-	private async connect(): Promise<void> {
-		if (!this.#dispatch({ type: "CONNECT" })) {
+	private async connect(reason: ConnectionStateReason): Promise<void> {
+		if (!this.#dispatch({ type: "CONNECT" }, reason)) {
 			return;
 		}
+		this.#telemetry.connectStarted();
 		try {
-			// Close any existing socket before creating a new one
 			if (this.#currentSocket) {
-				this.#currentSocket.close(
-					WebSocketCloseCode.NORMAL,
-					"Replacing connection",
-				);
+				this.#telemetry.dropped("replaced", WebSocketCloseCode.NORMAL);
+				const previousSocket = this.#currentSocket;
 				this.#currentSocket = null;
+				previousSocket.close(WebSocketCloseCode.NORMAL, "Replacing connection");
 			}
 
 			const socket = await this.#socketFactory();
@@ -303,12 +367,14 @@ export class ReconnectingWebSocket<
 					return;
 				}
 
-				if (!this.#dispatch({ type: "OPEN" })) {
+				if (!this.#dispatch({ type: "OPEN" }, "open")) {
 					return;
 				}
+				this.#telemetry.opened(this.#route);
 				// Reset backoff on successful connection
 				this.#backoffMs = this.#options.initialBackoffMs;
 				this.#certRefreshAttempted = false;
+				this.#consecutiveConnectFailures = 0;
 				this.executeHandlers("open", event);
 			});
 
@@ -334,46 +400,82 @@ export class ReconnectingWebSocket<
 			});
 
 			socket.addEventListener("close", (event) => {
-				if (this.#currentSocket !== socket) {
-					return;
+				if (this.#currentSocket === socket) {
+					this.handleSocketClose(event);
 				}
-
-				if (
-					this.#state === ConnectionState.DISPOSED ||
-					this.#state === ConnectionState.DISCONNECTED
-				) {
-					return;
-				}
-
-				this.executeHandlers("close", event);
-
-				if (UNRECOVERABLE_WS_CLOSE_CODES.has(event.code)) {
-					this.#logger.error(
-						`WebSocket connection closed with unrecoverable error code ${event.code}`,
-					);
-					this.disconnect();
-					return;
-				}
-
-				if (NORMAL_CLOSURE_CODES.has(event.code)) {
-					return;
-				}
-
-				this.scheduleReconnect();
 			});
 		} catch (error) {
 			await this.handleConnectionError(error);
 		}
 	}
 
-	private scheduleReconnect(): void {
-		if (!this.#dispatch({ type: "SCHEDULE_RETRY" })) {
+	private handleSocketClose(event: CloseEvent): void {
+		if (
+			this.#state === ConnectionState.DISPOSED ||
+			this.#state === ConnectionState.DISCONNECTED
+		) {
 			return;
 		}
 
+		this.executeHandlers("close", event);
+
+		if (UNRECOVERABLE_WS_CLOSE_CODES.has(event.code)) {
+			this.#logger.error(
+				`WebSocket connection closed with unrecoverable error code ${event.code} for ${this.#route}`,
+			);
+			this.disconnectWithReason("unrecoverable_close", "unrecoverable_close", {
+				code: event.code,
+				closeReason: event.reason,
+				error: toCloseEventError(event),
+				failure: true,
+			});
+			return;
+		}
+
+		// Every close that reaches here is server-initiated: intentional
+		// disconnect()/close() dispatch first and return early above. Normal
+		// codes such as coderd's liveness 1001 or a shutdown 1000 must reconnect,
+		// so they fall through to the backoff retry below.
+		this.scheduleReconnect("unexpected_close", "unexpected_close", {
+			code: event.code,
+			error: toCloseEventError(event),
+		});
+	}
+
+	private scheduleReconnect(
+		reason: ConnectionStateReason,
+		cause: ConnectionDropCause,
+		options: { code?: number; error?: unknown } = {},
+	): void {
+		if (!this.#dispatch({ type: "SCHEDULE_RETRY" }, reason)) {
+			return;
+		}
+
+		this.#consecutiveConnectFailures += 1;
+		if (
+			this.#consecutiveConnectFailures === MAX_RECONNECT_FAILURES_BEFORE_FLUSH
+		) {
+			this.#logger.warn(
+				`Server unreachable after ${this.#consecutiveConnectFailures} reconnect attempts for ${this.#route}, still retrying`,
+			);
+			this.#telemetry.unreachable(
+				this.#route,
+				this.#consecutiveConnectFailures,
+			);
+			this.#logger.flush(`unreachable ${this.#route}`);
+		}
 		const jitter =
 			this.#backoffMs * this.#options.jitterFactor * (Math.random() * 2 - 1);
 		const delayMs = Math.max(0, this.#backoffMs + jitter);
+		this.#telemetry.retrying(
+			reason,
+			{
+				cause,
+				code: options.code,
+				error: options.error,
+			},
+			delayMs,
+		);
 
 		this.#logger.debug(
 			`Reconnecting WebSocket in ${Math.round(delayMs)}ms for ${this.#route}`,
@@ -381,29 +483,13 @@ export class ReconnectingWebSocket<
 
 		this.#reconnectTimeoutId = setTimeout(() => {
 			this.#reconnectTimeoutId = null;
-			// connect() handles all errors internally
-			void this.connect();
+			void this.connect("scheduled_reconnect");
 		}, delayMs);
 
 		this.#backoffMs = Math.min(this.#backoffMs * 2, this.#options.maxBackoffMs);
 	}
 
-	/**
-	 * Attempt to refresh certificates and return true if refresh succeeded.
-	 */
-	private async attemptCertificateRefresh(): Promise<boolean> {
-		try {
-			return await this.#options.onCertificateRefreshNeeded();
-		} catch (refreshError) {
-			this.#logger.error("Error during certificate refresh:", refreshError);
-			return false;
-		}
-	}
-
-	/**
-	 * Handle client certificate errors by attempting refresh for refreshable errors.
-	 * @returns true if refresh succeeded.
-	 */
+	/** Returns true if refresh succeeded and the caller should retry. */
 	private async handleClientCertificateError(
 		certError: ClientCertificateError,
 	): Promise<boolean> {
@@ -415,17 +501,20 @@ export class ReconnectingWebSocket<
 		}
 
 		if (certError.isRefreshable) {
-			this.#certRefreshAttempted = true; // Mark that we're attempting
+			this.#certRefreshAttempted = true;
 			this.#logger.info(
 				`Client certificate error (alert ${certError.alertCode}), attempting refresh...`,
 			);
-			if (await this.attemptCertificateRefresh()) {
-				this.#logger.info("Certificate refresh succeeded, reconnecting...");
-				return true;
+			try {
+				if (await this.#options.onCertificateRefreshNeeded()) {
+					this.#logger.info("Certificate refresh succeeded, reconnecting...");
+					return true;
+				}
+			} catch (refreshError) {
+				this.#logger.error("Error during certificate refresh:", refreshError);
 			}
 		}
 
-		// Show notification for failed/non-refreshable errors
 		void certError.showNotification();
 		return false;
 	}
@@ -462,12 +551,18 @@ export class ReconnectingWebSocket<
 			return;
 		}
 
-		if (this.isUnrecoverableHttpError(error)) {
+		const unrecoverableStatus = this.unrecoverableHttpStatus(error);
+		if (unrecoverableStatus !== undefined) {
 			this.#logger.error(
-				`Unrecoverable HTTP error during connection for ${this.#route}`,
+				`Unrecoverable HTTP error (${unrecoverableStatus}) during connection for ${this.#route}`,
 				error,
 			);
-			this.disconnect();
+			// A 401 explains itself, and with OAuth a refresh reconnects the same
+			// socket, so it never flushes.
+			this.disconnectWithReason("unrecoverable_http", "error", {
+				error,
+				failure: unrecoverableStatus !== HttpStatusCode.UNAUTHORIZED,
+			});
 			return;
 		}
 
@@ -475,34 +570,37 @@ export class ReconnectingWebSocket<
 		const certError = ClientCertificateError.fromError(error);
 		if (certError) {
 			if (await this.handleClientCertificateError(certError)) {
-				this.reconnect();
+				this.#reconnectInternal("certificate_refresh");
 			} else {
-				this.disconnect();
+				this.disconnectWithReason("certificate_error", "error", {
+					error,
+					failure: true,
+				});
 			}
 			return;
 		}
 
 		this.#logger.warn(`WebSocket connection failed for ${this.#route}`, error);
-		this.scheduleReconnect();
+		this.scheduleReconnect("connection_error", "error", { error });
 	}
 
 	/**
-	 * Check if an error message contains an unrecoverable HTTP status code.
+	 * Returns the unrecoverable HTTP status carried by a failed handshake, or
+	 * `undefined`.
 	 */
-	private isUnrecoverableHttpError(error: unknown): boolean {
-		const message = (error as { message?: string }).message || String(error);
-		for (const code of UNRECOVERABLE_HTTP_CODES) {
-			if (message.includes(String(code))) {
-				return true;
-			}
+	private unrecoverableHttpStatus(error: unknown): number | undefined {
+		const status = handshakeStatus(error);
+		if (status === undefined) {
+			return undefined;
 		}
-		return false;
+		return UNRECOVERABLE_HTTP_CODES.has(status) ? status : undefined;
 	}
 
 	private dispose(code?: number, reason?: string): void {
-		if (!this.#dispatch({ type: "DISPOSE" })) {
+		if (!this.#dispatch({ type: "DISPOSE" }, "dispose")) {
 			return;
 		}
+		this.#telemetry.terminated("dispose", { cause: "disposed", code });
 		this.clearCurrentSocket(code, reason);
 
 		for (const set of Object.values(this.#eventHandlers)) {
@@ -522,5 +620,6 @@ export class ReconnectingWebSocket<
 			this.#currentSocket.close(code, reason);
 			this.#currentSocket = null;
 		}
+		this.#telemetry.reset();
 	}
 }

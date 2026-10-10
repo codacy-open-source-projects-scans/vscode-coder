@@ -22,9 +22,16 @@ Object.entries(supports).forEach(([version, expected]) => {
 	});
 });
 
-it("current shell supports ssh", () => {
-	expect(sshSupportsSetEnv()).toBeTruthy();
-});
+/**
+ * Spawning real `ssh` is slow on Windows CI runners, so allow a larger budget there.
+ */
+it(
+	"current shell supports ssh",
+	{ timeout: process.platform === "win32" ? 30_000 : undefined },
+	() => {
+		expect(sshSupportsSetEnv()).toBeTruthy();
+	},
+);
 
 describe("computeSshProperties", () => {
 	it("computes the config for a host", () => {
@@ -43,9 +50,9 @@ Host coder-vscode--*
 		);
 
 		expect(properties).toEqual({
-			Another: "true",
-			StrictHostKeyChecking: "yes",
-			ProxyCommand: '/tmp/coder --header="X-FOO=bar" coder.dev',
+			another: "true",
+			stricthostkeychecking: "yes",
+			proxycommand: '/tmp/coder --header="X-FOO=bar" coder.dev',
 		});
 	});
 
@@ -71,9 +78,30 @@ Host coder-v?code--*
 		);
 
 		expect(properties).toEqual({
-			Another: "true",
-			StrictHostKeyChecking: "yes",
-			ProxyCommand: '/tmp/coder --header="X-BAR=foo" coder.dev',
+			another: "true",
+			stricthostkeychecking: "yes",
+			proxycommand: '/tmp/coder --header="X-BAR=foo" coder.dev',
+		});
+	});
+
+	it("resolves directives case-insensitively, first obtained value wins", () => {
+		const properties = computeSshProperties(
+			"coder-vscode.example.com--user--ws",
+			`host coder-vscode.example.com--*
+  proxycommand /path/to/coder ssh --stdio %h
+  RemoteCommand exec /bin/first
+  remotecommand exec /bin/second
+
+Host *
+  REMOTECOMMAND exec /bin/fallback
+  ForwardAgent yes
+`,
+		);
+
+		expect(properties).toEqual({
+			proxycommand: "/path/to/coder ssh --stdio %h",
+			remotecommand: "exec /bin/first",
+			forwardagent: "yes",
 		});
 	});
 
@@ -91,8 +119,8 @@ Host coder-vscode.example.com--*
   RemoteCommand exec /bin/bash -l
 `,
 		);
-		expect(props.RemoteCommand).toBe("exec /bin/bash -l");
-		expect(props.ProxyCommand).toBe("/path/to/coder ssh --stdio %h");
+		expect(props.remotecommand).toBe("exec /bin/bash -l");
+		expect(props.proxycommand).toBe("/path/to/coder ssh --stdio %h");
 	});
 
 	it("returns RemoteCommand none literally", () => {
@@ -102,7 +130,7 @@ Host coder-vscode.example.com--*
   RemoteCommand none
 `,
 		);
-		expect(props.RemoteCommand).toBe("none");
+		expect(props.remotecommand).toBe("none");
 	});
 
 	it("inherits RemoteCommand from a Host * block", () => {
@@ -115,7 +143,7 @@ Host coder-vscode.example.com--*
   ProxyCommand /path/to/coder ssh --stdio %h
 `,
 		);
-		expect(props.RemoteCommand).toBe("exec /bin/zsh -l");
+		expect(props.remotecommand).toBe("exec /bin/zsh -l");
 	});
 
 	it("handles RemoteCommand with = delimiter", () => {
@@ -125,7 +153,7 @@ Host coder-vscode.example.com--*
   RemoteCommand=exec /bin/bash -l
 `,
 		);
-		expect(props.RemoteCommand).toBe("exec /bin/bash -l");
+		expect(props.remotecommand).toBe("exec /bin/bash -l");
 	});
 
 	it("properly escapes meaningful regex characters", () => {
@@ -157,10 +185,10 @@ Host coder-vscode.dev.coder.com--*
 		);
 
 		expect(properties).toEqual({
-			StrictHostKeyChecking: "yes",
-			ProxyCommand:
+			stricthostkeychecking: "yes",
+			proxycommand:
 				'"/Users/matifali/Library/Application Support/Code/User/globalStorage/coder.coder-remote/dev.coder.com/bin/coder-darwin-arm64" vscodessh --network-info-dir "/Users/matifali/Library/Application Support/Code/User/globalStorage/coder.coder-remote/net" --session-token-file "/Users/matifali/Library/Application Support/Code/User/globalStorage/coder.coder-remote/dev.coder.com/session" --url-file "/Users/matifali/Library/Application Support/Code/User/globalStorage/coder.coder-remote/dev.coder.com/url" %h',
-			UserKnownHostsFile: "/dev/null",
+			userknownhostsfile: "/dev/null",
 		});
 	});
 });

@@ -1,7 +1,7 @@
 {
 	"name": "coder-remote",
 	"displayName": "Coder",
-	"version": "1.14.4",
+	"version": "1.16.4",
 	"description": "Open any workspace with a single click.",
 	"categories": [
 		"Other"
@@ -17,25 +17,38 @@
 	"publisher": "coder",
 	"type": "commonjs",
 	"main": "./dist/extension.js",
+	"files": [
+		"dist/**/*.{js,css,ttf}",
+		"media/*.{png,svg}",
+		"pgp-public.key",
+		"CHANGELOG.md",
+		"LICENSE"
+	],
 	"scripts": {
-		"build": "concurrently -g -n webviews,extension,compile-tests:integration \"pnpm build:webviews\" \"node esbuild.mjs\" \"pnpm compile-tests:integration\"",
+		"build": "concurrently -g -n webviews,extension \"pnpm build:webviews\" \"node scripts/esbuild.mjs\"",
 		"build:production": "cross-env NODE_ENV=production pnpm build",
+		"build:test": "tsc -p test/integration --outDir out --noCheck",
 		"build:webviews": "pnpm -r --filter \"./packages/*\" --parallel build",
-		"compile-tests:integration": "tsc -p test/integration --outDir out --noCheck",
-		"format": "prettier --write --cache --cache-strategy content .",
-		"format:check": "prettier --check --cache --cache-strategy content .",
-		"lint": "eslint --cache --cache-strategy content .",
-		"lint:fix": "pnpm lint --fix",
+		"format": "node scripts/run-tool.mjs oxfmt --write .",
+		"format:check": "node scripts/run-tool.mjs oxfmt --check .",
+		"lint": "concurrently -g -n oxlint,eslint \"pnpm lint:oxlint\" \"pnpm lint:eslint\"",
+		"lint:eslint": "node scripts/run-tool.mjs eslint --cache --cache-strategy content --cache-location node_modules/.cache/eslint/ .",
+		"lint:fix": "pnpm lint:oxlint --fix && pnpm lint:eslint --fix",
+		"lint:oxlint": "node scripts/run-tool.mjs oxlint --type-aware .",
 		"package": "pnpm build:production && vsce package --no-dependencies",
 		"package:prerelease": "pnpm build:production && vsce package --pre-release --no-dependencies",
+		"storybook": "storybook dev -p 6006 --config-dir .storybook",
+		"storybook:build": "storybook build --config-dir .storybook",
+		"storybook:ci": "storybook build --test --config-dir .storybook",
+		"sync:vscode-themes": "node .storybook/themes/sync.mjs",
 		"test": "cross-env CI=true ELECTRON_RUN_AS_NODE=1 electron node_modules/vitest/vitest.mjs",
 		"test:extension": "cross-env ELECTRON_RUN_AS_NODE=1 electron node_modules/vitest/vitest.mjs --project extension",
-		"test:integration": "pnpm compile-tests:integration && node esbuild.mjs && vscode-test",
+		"test:integration": "pnpm build:test && node scripts/esbuild.mjs && vscode-test --config test/integration/.vscode-test.mjs",
 		"test:webview": "cross-env ELECTRON_RUN_AS_NODE=1 electron node_modules/vitest/vitest.mjs --project webview",
-		"typecheck": "concurrently -g -n extension,tests,packages \"tsc --noEmit\" \"tsc --noEmit -p test\" \"pnpm typecheck:packages\"",
+		"typecheck": "concurrently -g -n extension,tests,packages,storybook \"tsc --noEmit\" \"tsc --noEmit -p test\" \"pnpm typecheck:packages\" \"tsc --noEmit -p .storybook\"",
 		"typecheck:packages": "pnpm -r --filter \"./packages/*\" --parallel typecheck",
 		"watch": "concurrently -g -n extension,webviews \"pnpm watch:extension\" \"pnpm watch:webviews\"",
-		"watch:extension": "node esbuild.mjs --watch",
+		"watch:extension": "node scripts/esbuild.mjs --watch",
 		"watch:webviews": "pnpm -r --filter \"./packages/*\" --parallel dev"
 	},
 	"contributes": {
@@ -50,77 +63,109 @@
 						"type": "string",
 						"pattern": "^[a-zA-Z0-9-]+[=\\s].*$"
 					},
-					"scope": "machine"
+					"scope": "application",
+					"ignoreSync": true
 				},
 				"coder.insecure": {
 					"markdownDescription": "If true, the extension will not verify the authenticity of the remote host. This is useful for self-signed certificates.",
 					"type": "boolean",
-					"default": false
+					"default": false,
+					"scope": "application"
 				},
 				"coder.binarySource": {
 					"markdownDescription": "Used to download the Coder CLI which is necessary to make SSH connections. The If-None-Match header will be set to the SHA1 of the CLI and can be used for caching. Absolute URLs will be used as-is; otherwise this value will be resolved against the deployment domain. Defaults to downloading from the Coder deployment.",
 					"type": "string",
-					"default": ""
+					"default": "",
+					"scope": "application",
+					"ignoreSync": true
 				},
 				"coder.binaryDestination": {
-					"markdownDescription": "The path to the Coder CLI binary or the directory containing it. When set to a file path (e.g., `/usr/bin/coder`), the extension checks its version and downloads a replacement if it does not match the server (and downloads are enabled). When set to a directory, the extension looks for the CLI inside it (downloading if enabled). Defaults to the value of `CODER_BINARY_DESTINATION` if not set, otherwise the extension's global storage directory.",
+					"markdownDescription": "The path to the Coder CLI binary or the directory containing it. When set to a file path (e.g., `/usr/bin/coder`), the extension checks its version and downloads a replacement if it does not match the server (and downloads are enabled). When set to a directory, the extension looks for the CLI inside it (downloading if enabled). Defaults to the value of `CODER_BINARY_DESTINATION` if not set, otherwise the extension's global storage directory.\n\nSupports `${env:VAR}`, `${userHome}`, and a leading `~`.",
 					"type": "string",
-					"default": ""
+					"default": "",
+					"scope": "application",
+					"ignoreSync": true
 				},
 				"coder.enableDownloads": {
 					"markdownDescription": "Allow the plugin to download the CLI when missing or out of date.",
 					"type": "boolean",
-					"default": true
+					"default": true,
+					"scope": "application"
 				},
 				"coder.headerCommand": {
 					"markdownDescription": "An external command that outputs additional HTTP headers added to all requests. The command must output each header as `key=value` on its own line. The following environment variables will be available to the process: `CODER_URL`. Defaults to the value of `CODER_HEADER_COMMAND` if not set.",
 					"type": "string",
-					"default": ""
+					"default": "",
+					"scope": "application",
+					"ignoreSync": true
 				},
 				"coder.tlsCertFile": {
-					"markdownDescription": "Path to file for TLS client cert. When specified, token authorization will be skipped. `http.proxySupport` must be set to `on` or `off`, otherwise VS Code will override the proxy agent set by the plugin.",
+					"markdownDescription": "Path to file for TLS client cert. When specified, token authorization will be skipped. `http.proxySupport` must be set to `on` or `off`, otherwise VS Code will override the proxy agent set by the plugin.\n\nSupports `${env:VAR}`, `${userHome}`, and a leading `~`.",
 					"type": "string",
-					"default": ""
+					"default": "",
+					"scope": "application",
+					"ignoreSync": true
 				},
 				"coder.tlsKeyFile": {
-					"markdownDescription": "Path to file for TLS client key. When specified, token authorization will be skipped. `http.proxySupport` must be set to `on` or `off`, otherwise VS Code will override the proxy agent set by the plugin.",
+					"markdownDescription": "Path to file for TLS client key. When specified, token authorization will be skipped. `http.proxySupport` must be set to `on` or `off`, otherwise VS Code will override the proxy agent set by the plugin.\n\nSupports `${env:VAR}`, `${userHome}`, and a leading `~`.",
 					"type": "string",
-					"default": ""
+					"default": "",
+					"scope": "application",
+					"ignoreSync": true
 				},
 				"coder.tlsCaFile": {
-					"markdownDescription": "Path to file for TLS certificate authority. `http.proxySupport` must be set to `on` or `off`, otherwise VS Code will override the proxy agent set by the plugin.",
+					"markdownDescription": "Path to file for TLS certificate authority. `http.proxySupport` must be set to `on` or `off`, otherwise VS Code will override the proxy agent set by the plugin.\n\nSupports `${env:VAR}`, `${userHome}`, and a leading `~`.",
 					"type": "string",
-					"default": ""
+					"default": "",
+					"scope": "application",
+					"ignoreSync": true
 				},
 				"coder.tlsAltHost": {
-					"markdownDescription": "Alternative hostname to use for TLS verification. This is useful when the hostname in the certificate does not match the hostname used to connect.",
+					"markdownDescription": "Alternative hostname to use for TLS verification. This is useful when the hostname in the certificate does not match the hostname used to connect.\n\nSupports `${env:VAR}` substitution.",
 					"type": "string",
-					"default": ""
+					"default": "",
+					"scope": "application",
+					"ignoreSync": true
 				},
 				"coder.tlsCertRefreshCommand": {
 					"markdownDescription": "Command to run when TLS client certificate errors occur (e.g., expired, revoked, or rejected certificates). If configured, the extension will automatically execute this command and retry failed requests. `http.proxySupport` must be set to `on` or `off`, otherwise VS Code will override the proxy agent set by the plugin.",
 					"type": "string",
-					"default": ""
+					"default": "",
+					"scope": "application",
+					"ignoreSync": true
 				},
 				"coder.proxyLogDirectory": {
-					"markdownDescription": "Directory where the Coder CLI outputs SSH connection logs for debugging. Defaults to the value of `CODER_SSH_LOG_DIR` if not set, otherwise the extension's global storage directory.",
+					"markdownDescription": "Directory where the Coder CLI outputs SSH connection logs for debugging. Defaults to the value of `CODER_SSH_LOG_DIR` if not set, otherwise the extension's global storage directory.\n\nSupports `${env:VAR}`, `${userHome}`, and a leading `~`.",
 					"type": "string",
-					"default": ""
+					"default": "",
+					"scope": "application",
+					"ignoreSync": true
 				},
 				"coder.proxyBypass": {
-					"markdownDescription": "If not set, will inherit from the `no_proxy` or `NO_PROXY` environment variables. `http.proxySupport` must be set to `on` or `off`, otherwise VS Code will override the proxy agent set by the plugin.",
+					"markdownDescription": "If not set, will inherit from the `no_proxy` or `NO_PROXY` environment variables. Has no effect when `http.proxySupport` is set to `off`. With values other than `on`, VS Code will override the proxy agent set by the plugin.",
+					"markdownDeprecationMessage": "Deprecated: prefer `http.noProxy`.",
 					"type": "string",
-					"default": ""
+					"default": "",
+					"scope": "application",
+					"ignoreSync": true
 				},
 				"coder.defaultUrl": {
 					"markdownDescription": "This will be shown in the URL prompt, along with the CODER_URL environment variable if set, for the user to select when logging in.",
 					"type": "string",
-					"default": ""
+					"default": "",
+					"scope": "application"
+				},
+				"coder.alternativeWebUrl": {
+					"markdownDescription": "Alternative URL for opening Coder pages in the browser (dashboard, workspace, and login pages). API, SSH, and CLI always use the connection URL; when this is empty, so does the browser. Useful when the API runs on a browser-restricted port (e.g. 7004) but the web UI is served on a standard port (e.g. 443).",
+					"type": "string",
+					"default": "",
+					"scope": "application"
 				},
 				"coder.autologin": {
 					"markdownDescription": "Automatically log into the default URL when the extension is activated. coder.defaultUrl is preferred, otherwise the CODER_URL environment variable will be used. This setting has no effect if neither is set.",
 					"type": "boolean",
-					"default": false
+					"default": false,
+					"scope": "application"
 				},
 				"coder.disableNotifications": {
 					"markdownDescription": "Disable all notification prompts from the Coder deployment (workspace updates, scheduling reminders, resource alerts, etc.). Notifications are delivered by your Coder server and displayed by this extension.",
@@ -135,7 +180,8 @@
 				"coder.disableSignatureVerification": {
 					"markdownDescription": "Disable Coder CLI signature verification, which can be useful if you run an unsigned fork of the binary.",
 					"type": "boolean",
-					"default": false
+					"default": false,
+					"scope": "application"
 				},
 				"coder.experimental.oauth": {
 					"markdownDescription": "Enable [OAuth 2.1](https://coder.com/docs/admin/integrations/oauth2-provider) authentication. When enabled, you'll be prompted to choose between OAuth and session token authentication during login. OAuth provides automatic token refresh, eliminating the need to manually re-authenticate when your session expires.",
@@ -153,25 +199,37 @@
 					},
 					"default": [
 						"--disable-autostart"
-					]
+					],
+					"scope": "application",
+					"ignoreSync": true
 				},
 				"coder.globalFlags": {
-					"markdownDescription": "Global flags to pass to every Coder CLI invocation. Enter each flag as a separate array item; values are passed verbatim and in order. Do **not** include the `coder` command itself. See the [CLI reference](https://coder.com/docs/reference/cli) for available global flags.\n\nNote that for `--header-command`, precedence is: `#coder.headerCommand#` setting, then `CODER_HEADER_COMMAND` environment variable, then the value specified here. The `--global-config` and `--use-keyring` flags are silently ignored as the extension manages them via `#coder.useKeyring#`.",
+					"markdownDescription": "Global flags to pass to every Coder CLI invocation. Enter each flag as a separate array item, in order. Do **not** include the `coder` command itself. See the [CLI reference](https://coder.com/docs/reference/cli) for available global flags.\n\nSupports `${env:VAR}`, `${userHome}`, and a leading `~`. For `--flag=value` items the expansion applies to the value half, so `--cfg=~/coder` works.\n\nTo share a config directory with the `coder` CLI, add `--global-config` here (for example `--global-config=~/.config/coderv2`) or set `CODER_CONFIG_DIR`. Requires Coder CLI 2.32.0 or later. A `--use-keyring` item is ignored; use `#coder.useKeyring#` instead.\n\nFor `--header-command`, precedence is: `#coder.headerCommand#` setting, then `CODER_HEADER_COMMAND` environment variable, then the value specified here.",
 					"type": "array",
 					"items": {
 						"type": "string"
-					}
+					},
+					"scope": "application",
+					"ignoreSync": true
 				},
 				"coder.useKeyring": {
-					"markdownDescription": "Store session tokens in the OS keyring (macOS Keychain, Windows Credential Manager) instead of plaintext files. Requires CLI >= 2.29.0 (>= 2.31.0 to sync login from CLI to VS Code). This will attempt to sync between the CLI and VS Code since they share the same keyring entry. It will log you out of the CLI if you log out of the IDE, and vice versa. Has no effect on Linux.",
+					"markdownDescription": "Store session tokens in the OS keyring (macOS Keychain, Windows Credential Manager) instead of a file. Requires Coder CLI 2.29.0 or later; 2.32.0 or later to sign in with the CLI's existing session. Has no effect on Linux.\n\nThe keyring entry is shared with the `coder` CLI: signing in here also signs in the CLI, and signing out asks whether to sign out the CLI too.",
 					"type": "boolean",
-					"default": false
+					"default": true,
+					"scope": "application"
 				},
 				"coder.networkThreshold.latencyMs": {
 					"markdownDescription": "Latency threshold in milliseconds. A warning indicator appears in the status bar when latency exceeds this value. Set to `0` to disable.",
 					"type": "number",
 					"minimum": 0,
 					"default": 250
+				},
+				"coder.connectionLogBuffer.size": {
+					"markdownDescription": "Maximum number of log entries below the Coder output channel's log level to keep in memory. When a connection fails terminally or you collect a support bundle, the extension replays them into the channel so a bundle can carry the detail leading up to the failure without debug logging enabled beforehand. Capture is best-effort, since the channel writes on its own schedule. Set to `0` to disable.",
+					"type": "number",
+					"minimum": 0,
+					"maximum": 10000,
+					"default": 1000
 				},
 				"coder.httpClientLogLevel": {
 					"markdownDescription": "Controls the verbosity of HTTP client logging. This affects what details are logged for each HTTP request and response.",
@@ -189,6 +247,76 @@
 						"Logs everything from *headers* plus request and response bodies (may include sensitive data)"
 					],
 					"default": "basic"
+				},
+				"coder.telemetry.level": {
+					"markdownDescription": "Controls Coder extension telemetry collection. Used to diagnose extension issues.",
+					"type": "string",
+					"enum": [
+						"off",
+						"local"
+					],
+					"markdownEnumDescriptions": [
+						"Disable telemetry collection.",
+						"Record events on this machine only."
+					],
+					"default": "local",
+					"tags": [
+						"telemetry"
+					]
+				},
+				"coder.telemetry.local": {
+					"markdownDescription": "Advanced tunables for local telemetry collection. The local sink writes events as JSON Lines under the extension's global storage. Used when `#coder.telemetry.level#` is `local`. Missing or invalid fields fall back to defaults.",
+					"type": "object",
+					"additionalProperties": false,
+					"properties": {
+						"flushIntervalMs": {
+							"type": "number",
+							"minimum": 1000,
+							"default": 15000,
+							"markdownDescription": "How often, in milliseconds, buffered events are written to disk."
+						},
+						"flushBatchSize": {
+							"type": "number",
+							"minimum": 1,
+							"default": 100,
+							"markdownDescription": "Number of buffered events that triggers an immediate write, ahead of the scheduled interval."
+						},
+						"bufferLimit": {
+							"type": "number",
+							"minimum": 10,
+							"default": 500,
+							"markdownDescription": "Maximum number of events held in memory. Oldest events are dropped on overflow. Should be at least `flushBatchSize`."
+						},
+						"maxFileBytes": {
+							"type": "number",
+							"minimum": 4096,
+							"default": 5242880,
+							"markdownDescription": "Maximum size, in bytes, of a single telemetry file before the sink rotates to a new one."
+						},
+						"maxAgeDays": {
+							"type": "number",
+							"minimum": 1,
+							"default": 30,
+							"markdownDescription": "Telemetry files older than this many days are deleted when the extension activates."
+						},
+						"maxTotalBytes": {
+							"type": "number",
+							"minimum": 4096,
+							"default": 104857600,
+							"markdownDescription": "Cap, in bytes, on the combined size of telemetry files. Oldest files are deleted on activation until the total is under the cap."
+						}
+					},
+					"default": {
+						"flushIntervalMs": 15000,
+						"flushBatchSize": 100,
+						"bufferLimit": 500,
+						"maxFileBytes": 5242880,
+						"maxAgeDays": 30,
+						"maxTotalBytes": 104857600
+					},
+					"tags": [
+						"telemetry"
+					]
 				}
 			}
 		},
@@ -201,14 +329,12 @@
 				},
 				{
 					"id": "coderTasks",
-					"title": "Coder Tasks",
+					"title": "Coder Tasks (Deprecated)",
 					"icon": "media/tasks-logo.svg"
-				}
-			],
-			"secondarySidebar": [
+				},
 				{
-					"id": "coderChat",
-					"title": "Coder Chat (Experimental)",
+					"id": "coderExperimentalWorkspaces",
+					"title": "Coder Remote (New)",
 					"icon": "media/shorthand-logo.svg"
 				}
 			]
@@ -219,13 +345,23 @@
 					"id": "myWorkspaces",
 					"name": "My Workspaces",
 					"visibility": "visible",
-					"icon": "media/logo-white.svg"
+					"icon": "media/logo-white.svg",
+					"initialSize": 2
+				},
+				{
+					"id": "sharedWorkspaces",
+					"name": "Shared Workspaces",
+					"visibility": "visible",
+					"icon": "media/logo-white.svg",
+					"initialSize": 1,
+					"when": "coder.authenticated"
 				},
 				{
 					"id": "allWorkspaces",
 					"name": "All Workspaces",
 					"visibility": "visible",
 					"icon": "media/logo-white.svg",
+					"initialSize": 1,
 					"when": "coder.authenticated && coder.isOwner"
 				}
 			],
@@ -234,23 +370,23 @@
 					"id": "coder.tasksLogin",
 					"name": "Coder Tasks",
 					"icon": "media/tasks-logo.svg",
-					"when": "!coder.authenticated"
+					"when": "!coder.authenticated && coder.tasksSupported"
 				},
 				{
 					"type": "webview",
 					"id": "coder.tasksPanel",
 					"name": "Coder Tasks",
 					"icon": "media/tasks-logo.svg",
-					"when": "coder.authenticated"
+					"when": "coder.authenticated && coder.tasksSupported"
 				}
 			],
-			"coderChat": [
+			"coderExperimentalWorkspaces": [
 				{
 					"type": "webview",
-					"id": "coder.chatPanel",
-					"name": "Coder Chat (Experimental)",
+					"id": "coder.workspacesPanel",
+					"name": "Workspaces",
 					"icon": "media/shorthand-logo.svg",
-					"when": "coder.agentsEnabled"
+					"when": "coder.authenticated && coder.workspacesPanelEnabled"
 				}
 			]
 		},
@@ -264,6 +400,16 @@
 				"view": "coder.tasksLogin",
 				"contents": "Sign in to view and manage Coder tasks.\n[Login](command:coder.login)",
 				"when": "!coder.authenticated && coder.loaded"
+			},
+			{
+				"view": "sharedWorkspaces",
+				"contents": "Shared workspaces require Coder 2.27.0 or newer.",
+				"when": "coder.authenticated && !coder.sharedWorkspacesSupported"
+			},
+			{
+				"view": "sharedWorkspaces",
+				"contents": "No workspaces have been shared with you.",
+				"when": "coder.authenticated && coder.sharedWorkspacesSupported"
 			}
 		],
 		"commands": [
@@ -296,6 +442,11 @@
 				"title": "Open Workspace",
 				"category": "Coder",
 				"icon": "$(play)"
+			},
+			{
+				"command": "coder.openDevContainer",
+				"title": "Open Dev Container",
+				"category": "Coder"
 			},
 			{
 				"command": "coder.createWorkspace",
@@ -332,14 +483,38 @@
 				"category": "Coder"
 			},
 			{
+				"command": "coder.netcheck",
+				"title": "Network Check",
+				"category": "Coder"
+			},
+			{
 				"command": "coder.supportBundle",
 				"title": "Create Support Bundle",
 				"category": "Coder"
 			},
 			{
 				"command": "coder.viewLogs",
-				"title": "Coder: View Logs",
+				"title": "View Logs",
+				"category": "Coder",
 				"icon": "$(list-unordered)"
+			},
+			{
+				"command": "coder.openSshConfig",
+				"title": "Open Generated SSH Configuration File",
+				"category": "Coder",
+				"icon": "$(file-code)"
+			},
+			{
+				"command": "coder.exportTelemetry",
+				"title": "Export Telemetry",
+				"category": "Coder",
+				"icon": "$(save)"
+			},
+			{
+				"command": "coder.viewAnnouncements",
+				"title": "View Announcements",
+				"category": "Coder",
+				"icon": "$(megaphone)"
 			},
 			{
 				"command": "coder.openAppStatus",
@@ -349,6 +524,12 @@
 			},
 			{
 				"command": "coder.searchMyWorkspaces",
+				"title": "Search",
+				"category": "Coder",
+				"icon": "$(search)"
+			},
+			{
+				"command": "coder.searchSharedWorkspaces",
 				"title": "Search",
 				"category": "Coder",
 				"icon": "$(search)"
@@ -367,12 +548,6 @@
 			{
 				"command": "coder.tasks.refresh",
 				"title": "Refresh Tasks",
-				"category": "Coder",
-				"icon": "$(refresh)"
-			},
-			{
-				"command": "coder.chat.refresh",
-				"title": "Refresh Chat",
 				"category": "Coder",
 				"icon": "$(refresh)"
 			},
@@ -422,6 +597,10 @@
 					"when": "coder.authenticated"
 				},
 				{
+					"command": "coder.netcheck",
+					"when": "coder.authenticated"
+				},
+				{
 					"command": "coder.supportBundle",
 					"when": "coder.authenticated"
 				},
@@ -462,6 +641,18 @@
 					"when": "true"
 				},
 				{
+					"command": "coder.openSshConfig",
+					"when": "true"
+				},
+				{
+					"command": "coder.exportTelemetry",
+					"when": "true"
+				},
+				{
+					"command": "coder.viewAnnouncements",
+					"when": "coder.authenticated"
+				},
+				{
 					"command": "coder.openAppStatus",
 					"when": "false"
 				},
@@ -474,7 +665,15 @@
 					"when": "false"
 				},
 				{
+					"command": "coder.openDevContainer",
+					"when": "false"
+				},
+				{
 					"command": "coder.searchMyWorkspaces",
+					"when": "false"
+				},
+				{
+					"command": "coder.searchSharedWorkspaces",
 					"when": "false"
 				},
 				{
@@ -489,20 +688,23 @@
 					"when": "false"
 				},
 				{
-					"command": "coder.chat.refresh",
-					"when": "false"
-				},
-				{
 					"command": "coder.applyRecommendedSettings"
 				}
 			],
 			"view/title": [
 				{
 					"command": "coder.logout",
+					"group": "deployment@2",
+					"when": "coder.authenticated && view == myWorkspaces"
+				},
+				{
+					"command": "coder.netcheck",
+					"group": "diagnostics@1",
 					"when": "coder.authenticated && view == myWorkspaces"
 				},
 				{
 					"command": "coder.switchDeployment",
+					"group": "deployment@1",
 					"when": "coder.authenticated && view == myWorkspaces"
 				},
 				{
@@ -525,6 +727,16 @@
 					"group": "navigation@3"
 				},
 				{
+					"command": "coder.refreshWorkspaces",
+					"when": "coder.authenticated && view == sharedWorkspaces",
+					"group": "navigation@2"
+				},
+				{
+					"command": "coder.searchSharedWorkspaces",
+					"when": "coder.authenticated && view == sharedWorkspaces",
+					"group": "navigation@3"
+				},
+				{
 					"command": "coder.searchAllWorkspaces",
 					"when": "coder.authenticated && view == allWorkspaces",
 					"group": "navigation@3"
@@ -532,11 +744,6 @@
 				{
 					"command": "coder.tasks.refresh",
 					"when": "coder.authenticated && view == coder.tasksPanel",
-					"group": "navigation@1"
-				},
-				{
-					"command": "coder.chat.refresh",
-					"when": "view == coder.chatPanel",
 					"group": "navigation@1"
 				}
 			],
@@ -592,81 +799,94 @@
 	],
 	"dependencies": {
 		"@abraham/reflection": "^0.13.0",
-		"@peculiar/x509": "^2.0.0",
+		"@opentelemetry/api": "^1.9.1",
+		"@opentelemetry/api-logs": "^0.222.0",
+		"@peculiar/x509": "^2.1.0",
 		"@repo/shared": "workspace:*",
-		"axios": "1.15.0",
+		"axios": "^1.20.0",
 		"date-fns": "catalog:",
-		"eventsource": "^4.1.0",
-		"fflate": "^0.8.2",
+		"eventsource": "^5.1.2",
+		"fflate": "^0.8.3",
 		"find-process": "^2.1.1",
 		"jsonc-parser": "^3.3.1",
-		"openpgp": "^6.3.0",
-		"pretty-bytes": "^7.1.0",
+		"openpgp": "^6.3.2",
+		"pretty-bytes": "^7.2.0",
 		"proper-lockfile": "^4.1.2",
-		"proxy-agent": "^8.0.1",
-		"semver": "^7.7.4",
+		"proxy-agent": "^8.0.2",
+		"semver": "^7.8.5",
 		"strip-ansi": "^7.2.0",
 		"ua-parser-js": "^1.0.41",
-		"ws": "^8.20.0",
-		"zod": "^4.3.6"
+		"ws": "^8.22.0",
+		"zod": "^4.6.5"
 	},
 	"devDependencies": {
-		"@eslint-react/eslint-plugin": "^4.2.3",
-		"@eslint/js": "^10.0.1",
-		"@eslint/markdown": "^8.0.1",
+		"@coder/pixel-storybook": "^0.3.0",
+		"@eslint-react/eslint-plugin": "^5.24.9",
+		"@eslint/markdown": "^8.0.3",
+		"@repo/mocks": "workspace:*",
 		"@rolldown/plugin-babel": "catalog:",
+		"@storybook/addon-a11y": "catalog:",
+		"@storybook/addon-docs": "catalog:",
+		"@storybook/react-vite": "catalog:",
 		"@tanstack/react-query": "catalog:",
-		"@testing-library/jest-dom": "^6.9.1",
-		"@testing-library/react": "^16.3.2",
-		"@tsconfig/node22": "^22.0.5",
+		"@testing-library/jest-dom": "^7.0.1",
+		"@testing-library/react": "^16.3.3",
+		"@testing-library/user-event": "catalog:",
+		"@tsconfig/node22": "^22.0.6",
 		"@types/mocha": "^10.0.10",
-		"@types/node": "^22.19.17",
+		"@types/node": "^22.20.5",
 		"@types/proper-lockfile": "^4.1.4",
 		"@types/react": "catalog:",
 		"@types/react-dom": "catalog:",
-		"@types/semver": "^7.7.1",
+		"@types/semver": "^7.8.0",
 		"@types/ua-parser-js": "0.7.39",
-		"@types/vscode": "1.106.0",
-		"@types/ws": "^8.18.1",
-		"@typescript-eslint/eslint-plugin": "^8.59.1",
-		"@typescript-eslint/parser": "^8.59.1",
+		"@types/vscode": "1.105.0",
+		"@types/vscode-webview": "catalog:",
+		"@types/ws": "^8.18.2",
+		"@typescript/native": "npm:typescript@^7.0.2",
 		"@vitejs/plugin-react": "catalog:",
-		"@vitest/coverage-v8": "^4.1.5",
-		"@vscode/test-cli": "^0.0.12",
-		"@vscode/test-electron": "^2.5.2",
-		"@vscode/vsce": "^3.9.1",
+		"@vitest/coverage-v8": "^5.0.3",
+		"@vscode/codicons": "catalog:",
+		"@vscode/test-cli": "^0.0.15",
+		"@vscode/test-electron": "^3.1.0",
+		"@vscode/vsce": "^4.0.0",
 		"babel-plugin-react-compiler": "catalog:",
 		"bufferutil": "^4.1.0",
 		"coder": "catalog:",
-		"concurrently": "^9.2.1",
+		"concurrently": "^10.0.5",
 		"cross-env": "^10.1.0",
-		"dayjs": "^1.11.20",
-		"electron": "39.8.5",
-		"esbuild": "^0.28.0",
-		"eslint": "^10.2.1",
-		"eslint-config-prettier": "^10.1.8",
-		"eslint-import-resolver-typescript": "^4.4.4",
-		"eslint-plugin-import-x": "^4.16.2",
-		"eslint-plugin-package-json": "^0.91.2",
-		"globals": "^17.5.0",
-		"jsdom": "^29.1.0",
-		"jsonc-eslint-parser": "^3.1.0",
-		"memfs": "^4.57.2",
-		"prettier": "^3.8.3",
+		"dayjs": "^1.11.23",
+		"electron": "44.4.1",
+		"esbuild": "^0.28.2",
+		"eslint": "^10.11.0",
+		"eslint-import-resolver-typescript": "^4.4.5",
+		"eslint-plugin-import-x": "^4.17.1",
+		"eslint-plugin-oxlint": "^1.86.0",
+		"eslint-plugin-package-json": "^1.10.1",
+		"eslint-plugin-storybook": "^10.6.1",
+		"jsdom": "^30.1.2",
+		"memfs": "^4.80.0",
+		"oxfmt": "^0.71.0",
+		"oxlint": "^1.86.0",
+		"oxlint-plugin-eslint": "^1.86.0",
+		"oxlint-tsgolint": "^7.0.2003",
+		"playwright-core": "^1.63.0",
 		"react": "catalog:",
 		"react-dom": "catalog:",
+		"storybook": "catalog:",
+		"storybook-addon-pseudo-states": "catalog:",
 		"typescript": "catalog:",
-		"typescript-eslint": "^8.59.1",
+		"typescript-eslint": "^8.71.0",
 		"utf-8-validate": "^6.0.6",
 		"vite": "catalog:",
-		"vitest": "^4.1.5"
+		"vitest": "^5.0.3"
 	},
 	"extensionPack": [
 		"ms-vscode-remote.remote-ssh"
 	],
-	"packageManager": "pnpm@10.33.2",
+	"packageManager": "pnpm@12.10.1+sha512.ba40a37eb1a370d60fea8c4cf1d364c13bcccef518e98ad2bcee954f539d38da37458e58261a3fa55e06523450ea0ffff9f497b135be41f2c15c1642bacace6c",
 	"engines": {
-		"vscode": "^1.106.0",
+		"vscode": "^1.105.0",
 		"node": ">= 22"
 	},
 	"icon": "media/logo.png",

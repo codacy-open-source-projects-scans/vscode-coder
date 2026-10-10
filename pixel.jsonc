@@ -1,0 +1,15 @@
+{
+	"platformAccessUrl": "https://pixel.coder.com",
+	"projectId": "019ed223-272f-7e3e-82fc-a8a135e5b4ca",
+	"storybook": {
+		"buildCommand": "pnpm storybook:ci"
+	},
+	"matrix": {
+		// Values of the Storybook "theme" global, defined in
+		// .storybook/preview.ts. UI package stories add the high-contrast
+		// themes per story via parameters.pixel (PIXEL_ALL_THEMES). Browsers
+		// and viewports stay at the default since the webviews only ever
+		// render inside VS Code, which is Chromium.
+		"themes": ["light", "dark"]
+	}
+}

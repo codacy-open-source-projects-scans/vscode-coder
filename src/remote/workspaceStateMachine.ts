@@ -1,4 +1,8 @@
-import { createWorkspaceIdentifier, extractAgents } from "../api/api-helper";
+import { extractAgents, createWorkspaceIdentifier } from "../api/models";
+import {
+	collectUpdateParameters,
+	WorkspaceUpdateCancelledError,
+} from "../api/updateParameters";
 import {
 	LazyStream,
 	startWorkspace,
@@ -6,8 +10,10 @@ import {
 	streamAgentLogs,
 	streamBuildLogs,
 } from "../api/workspace";
-import { maybeAskAgent } from "../promptUtils";
-import { vscodeProposed } from "../vscodeProposed";
+import { errToStr } from "../error/normalize";
+import { WorkspaceOperationTelemetry } from "../instrumentation/workspace";
+import { maybeAskAgent } from "../ui/prompts";
+import { vscodeProposed } from "../vscode/proposed";
 
 import { TerminalOutputChannel } from "./terminalOutputChannel";
 
@@ -19,11 +25,13 @@ import type {
 import type * as vscode from "vscode";
 
 import type { CoderApi } from "../api/coderApi";
-import type { StartupMode } from "../core/mementoManager";
-import type { FeatureSet } from "../featureSet";
+import type { ServiceContainer } from "../container";
+import type { CliFeatureSet, ServerFeatureSet } from "../featureSet";
 import type { Logger } from "../logging/logger";
 import type { CliAuth } from "../settings/cli";
-import type { AuthorityParts } from "../util";
+import type { StartupMode } from "../storage/mementoManager";
+
+import type { AuthorityParts } from "./authority";
 
 /**
  * Manages workspace and agent state transitions until ready for SSH connection.
@@ -33,19 +41,33 @@ export class WorkspaceStateMachine implements vscode.Disposable {
 	private readonly terminal: TerminalOutputChannel;
 	private readonly buildLogStream = new LazyStream<ProvisionerJobLog>();
 	private readonly agentLogStream = new LazyStream<WorkspaceAgentLog[]>();
+	private readonly operationTelemetry: WorkspaceOperationTelemetry;
 
 	private agent: { id: string; name: string } | undefined;
+	private workspace: Workspace | undefined;
+	/** Stop build we posted, whose start the server queues behind it. */
+	private queuedStopBuild: string | undefined;
+
+	private readonly logger: Logger;
 
 	constructor(
 		private readonly parts: AuthorityParts,
 		private readonly workspaceClient: CoderApi,
 		private startupMode: StartupMode,
 		private readonly binaryPath: string,
-		private readonly featureSet: FeatureSet,
-		private readonly logger: Logger,
+		private readonly cliFeatures: CliFeatureSet,
+		private readonly serverFeatures: ServerFeatureSet,
 		private readonly cliAuth: CliAuth,
+		container: ServiceContainer,
 	) {
+		this.logger = container.getLogger();
 		this.terminal = new TerminalOutputChannel("Coder: Workspace Build");
+		const telemetry = container.getTelemetryService();
+		const workspaceName = `${parts.username}/${parts.workspace}`;
+		this.operationTelemetry = new WorkspaceOperationTelemetry(
+			telemetry,
+			workspaceName,
+		);
 	}
 
 	/**
@@ -56,21 +78,48 @@ export class WorkspaceStateMachine implements vscode.Disposable {
 		workspace: Workspace,
 		progress: vscode.Progress<{ message?: string }>,
 	): Promise<boolean> {
+		const current = this.workspace?.latest_build;
+		// Snapshots taken before the build we posted are stale.
+		if (current && workspace.latest_build.build_number < current.build_number) {
+			return false;
+		}
+		if (workspace.latest_build.id !== current?.id) {
+			// Logs stream from one build, so a new build needs a new stream.
+			this.buildLogStream.close();
+		}
+		this.workspace = workspace;
 		const workspaceName = createWorkspaceIdentifier(workspace);
 
 		switch (workspace.latest_build.status) {
-			case "running":
+			case "running": {
 				this.buildLogStream.close();
-				if (this.startupMode === "update") {
-					await this.triggerUpdate(workspace, workspaceName, progress);
-					// Agent IDs may have changed after an update.
-					this.agent = undefined;
-				}
+				const updated = await this.maybeUpdate(
+					workspace,
+					workspaceName,
+					progress,
+				);
+				if (!updated) break;
+				this.resetAgent();
+				if (updated.latest_build.status !== "running") return false;
+				workspace = updated;
 				break;
+			}
 
 			case "stopped":
 			case "failed": {
 				this.buildLogStream.close();
+				if (workspace.latest_build.id === this.queuedStopBuild) {
+					if (workspace.latest_build.status === "failed") {
+						throw new Error(
+							`Update failed for ${workspaceName}. Check the workspace in the dashboard before retrying.`,
+						);
+					}
+					// Starting it here would race the server's queued start.
+					progress.report({
+						message: `waiting for the server to start ${workspaceName}...`,
+					});
+					return false;
+				}
 
 				if (this.startupMode === "none") {
 					const choice = await this.confirmStartOrUpdate(
@@ -83,19 +132,27 @@ export class WorkspaceStateMachine implements vscode.Disposable {
 					this.startupMode = choice;
 				}
 
-				if (this.startupMode === "update") {
-					await this.triggerUpdate(workspace, workspaceName, progress);
-				} else {
+				const updated = await this.maybeUpdate(
+					workspace,
+					workspaceName,
+					progress,
+				);
+				if (!updated) {
+					// Start only when no update was requested.
 					await this.triggerStart(workspace, workspaceName, progress);
+					return false;
 				}
-				return false;
+				this.resetAgent();
+				if (updated.latest_build.status !== "running") return false;
+				workspace = updated;
+				break;
 			}
 
 			case "pending":
 			case "starting":
 			case "stopping": {
 				// Clear the agent since its ID could change after a restart
-				this.agent = undefined;
+				this.resetAgent();
 				this.agentLogStream.close();
 				progress.report({
 					message: `building ${workspaceName} (${workspace.latest_build.status})...`,
@@ -230,7 +287,8 @@ export class WorkspaceStateMachine implements vscode.Disposable {
 			binPath: this.binaryPath,
 			workspace,
 			write: (data: string) => this.terminal.write(data),
-			featureSet: this.featureSet,
+			cliFeatures: this.cliFeatures,
+			serverFeatures: this.serverFeatures,
 		};
 	}
 
@@ -244,46 +302,110 @@ export class WorkspaceStateMachine implements vscode.Disposable {
 			mode: this.startupMode,
 			status: workspace.latest_build.status,
 		});
-		await startWorkspace(this.buildCliContext(workspace));
+		await this.operationTelemetry.traceStart(() =>
+			startWorkspace(this.buildCliContext(workspace)),
+		);
 		this.logger.info(`${workspaceName} start initiated`);
 	}
 
-	private async triggerUpdate(
+	/** No-op outside update mode; asks before falling back to the old version. */
+	private async maybeUpdate(
 		workspace: Workspace,
 		workspaceName: string,
 		progress: vscode.Progress<{ message?: string }>,
-	): Promise<void> {
+	): Promise<Workspace | undefined> {
+		if (this.startupMode !== "update") return undefined;
+		// Downgrade up-front so monitor events don't retry the update.
+		this.startupMode = "start";
 		progress.report({ message: `updating ${workspaceName}...` });
 		this.logger.info(`Updating ${workspaceName}`, {
-			mode: this.startupMode,
 			status: workspace.latest_build.status,
 		});
-		await updateWorkspace(this.buildCliContext(workspace));
-		// Downgrade so subsequent transitions don't re-trigger the update.
-		this.startupMode = "start";
-		this.logger.info(`${workspaceName} update initiated`);
+		try {
+			const parameters = await this.operationTelemetry.traceParametersPrompt(
+				() => collectUpdateParameters(this.workspaceClient, workspace),
+			);
+			const updated = await this.operationTelemetry.traceUpdate(() =>
+				updateWorkspace(this.buildCliContext(workspace), parameters),
+			);
+			this.workspace = updated;
+			// Only the one-build update returns a stop; the server starts it after.
+			if (updated.latest_build.transition === "stop") {
+				this.queuedStopBuild = updated.latest_build.id;
+			}
+			this.logger.info(`${workspaceName} update initiated`);
+			return updated;
+		} catch (error) {
+			if (error instanceof WorkspaceUpdateCancelledError) {
+				this.logger.info(
+					`Update cancelled for ${workspaceName}; continuing with the existing version.`,
+				);
+				return undefined;
+			}
+			const reason = errToStr(error);
+			this.logger.warn(`Update failed for ${workspaceName}: ${reason}`);
+			const connect = await this.operationTelemetry.traceFailurePrompt(() =>
+				this.confirmConnectToExisting(workspaceName, reason),
+			);
+			if (!connect) {
+				throw error;
+			}
+			this.logger.info(`Connecting to the existing ${workspaceName} version`);
+			return undefined;
+		}
+	}
+
+	/** Offers the existing version after a failed update. */
+	private async confirmConnectToExisting(
+		workspaceName: string,
+		reason: string,
+	): Promise<boolean> {
+		const action = "Connect Anyway";
+		const choice = await vscodeProposed.window.showWarningMessage(
+			`Failed to update ${workspaceName}`,
+			{
+				useCustom: true,
+				modal: true,
+				detail: reason,
+			},
+			action,
+		);
+		return choice === action;
 	}
 
 	private async confirmStartOrUpdate(
 		workspaceName: string,
 		outdated: boolean,
 	): Promise<"start" | "update" | undefined> {
-		const buttons = outdated ? ["Start", "Update and Start"] : ["Start"];
-		const action = await vscodeProposed.window.showInformationMessage(
-			`The workspace ${workspaceName} is not running. How would you like to proceed?`,
-			{
-				useCustom: true,
-				modal: true,
-			},
-			...buttons,
-		);
-		if (action === "Start") return "start";
-		if (action === "Update and Start") return "update";
-		return undefined;
+		return this.operationTelemetry.traceStartPrompt(outdated, async () => {
+			const buttons = outdated
+				? (["Start", "Update and Start"] as const)
+				: (["Start"] as const);
+			const action = await vscodeProposed.window.showInformationMessage(
+				`The workspace ${workspaceName} is not running. How would you like to proceed?`,
+				{
+					useCustom: true,
+					modal: true,
+				},
+				...buttons,
+			);
+			if (action === "Start") return "start";
+			if (action === "Update and Start") return "update";
+			return undefined;
+		});
 	}
 
 	public getAgentId(): string | undefined {
 		return this.agent?.id;
+	}
+
+	public getWorkspace(): Workspace | undefined {
+		return this.workspace;
+	}
+
+	/** Clears the agent; its ID can change across builds. */
+	private resetAgent(): void {
+		this.agent = undefined;
 	}
 
 	dispose(): void {

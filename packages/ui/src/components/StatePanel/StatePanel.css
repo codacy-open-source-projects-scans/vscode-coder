@@ -1,0 +1,45 @@
+.ui-state-panel {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box;
+	width: 100%;
+	min-height: 10rem;
+	padding: var(--ui-spacing-240);
+	color: var(--ui-foreground);
+	text-align: center;
+}
+
+.ui-state-panel__icon {
+	margin-bottom: var(--ui-spacing-120);
+	color: var(--ui-state-icon-foreground);
+	font-size: 2rem;
+}
+
+/* The loading panel's spinner stands in for the icon */
+.ui-state-panel__spinner {
+	margin-bottom: var(--ui-spacing-120);
+}
+
+.ui-state-panel--error .ui-state-panel__icon {
+	color: var(--ui-error-foreground);
+}
+
+.ui-state-panel__title {
+	margin: 0;
+	font-size: 1rem;
+	font-weight: var(--ui-font-weight-semibold);
+	line-height: 1.4;
+}
+
+.ui-state-panel__description {
+	max-width: 28rem;
+	margin-top: var(--ui-spacing-60);
+	color: var(--ui-description-foreground);
+	line-height: 1.4;
+}
+
+.ui-state-panel__action {
+	margin-top: var(--ui-spacing-160);
+}

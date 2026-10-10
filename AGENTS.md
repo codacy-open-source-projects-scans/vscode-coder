@@ -1,130 +1,100 @@
 # Coder Extension Development Guidelines
 
-You are an experienced, pragmatic software engineer. Simple solutions
-over clever ones. Readability is a primary concern.
+The Coder Remote VS Code extension: an extension host (`src/`) and webview
+panels (`packages/`) sharing typed contracts through `@repo/shared`.
 
-## Our Relationship
+Make the smallest correct change, follow existing patterns, and verify the
+result. Prefer simple, readable solutions over clever ones; doing it right
+beats doing it fast. We're colleagues: prioritize correctness over agreement,
+push back on bad ideas and mistakes with evidence, and state uncertainty
+instead of guessing.
 
-We're colleagues - push back on bad ideas and speak up when something
-doesn't make sense. Honesty over agreeableness.
+## Autonomy
 
-- Disagree when I'm wrong - act as a critical peer reviewer
-- Call out bad ideas, unreasonable expectations, and mistakes
-- Ask for clarification rather than making assumptions
-- Discuss architectural decisions before implementation;
-  routine fixes don't need discussion
+- Resolve routine ambiguity from the code, tests, docs and git history. Make
+  reasonable, reversible assumptions that match existing patterns, state the
+  consequential ones, and keep going.
+- Ask only when the answer can't be recovered and would change the result,
+  or before a destructive or irreversible action.
+- Discuss architectural decisions first: new packages, dependencies, or
+  patterns that cross features. Routine fixes need no discussion.
+- Requests to implement, fix or investigate authorize that work even when
+  phrased as a question. Answer informational questions directly.
 
-## Foundational Rules
+## Guides
 
-- Doing it right is better than doing it fast
-- YAGNI - don't add features we don't need right now
-- Make the smallest reasonable changes to achieve the goal
-- Reduce code duplication, even if it takes extra effort
-- Match the style of surrounding code - consistency within a file matters
-- Fix bugs immediately when you find them
+Before changing anything under `packages/` or `test/webview/`, read
+[packages/AGENTS.md](packages/AGENTS.md); not every agent loads nested
+`AGENTS.md` files on its own. Otherwise read only what the task needs:
 
-## Essential Commands
+- Where code goes, naming, test placement: [docs/CODE_STRUCTURE.md](docs/CODE_STRUCTURE.md)
+- Tests: [docs/TESTING.md](docs/TESTING.md)
+- Opening workspaces, SSH config, logging: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- Telemetry: [src/instrumentation/CONVENTIONS.md](src/instrumentation/CONVENTIONS.md)
+- Lint, format, TypeScript, Node.js, dependencies: [docs/TOOLING.md](docs/TOOLING.md)
+- Running, PRs, reviews, releasing: [CONTRIBUTING.md](CONTRIBUTING.md)
 
-| Task                      | Command                                             |
-| ------------------------- | --------------------------------------------------- |
-| **Build**                 | `pnpm build`                                        |
-| **Watch mode**            | `pnpm watch`                                        |
-| **Package**               | `pnpm package`                                      |
-| **Type check**            | `pnpm typecheck`                                    |
-| **Format**                | `pnpm format`                                       |
-| **Format check**          | `pnpm format:check`                                 |
-| **Lint**                  | `pnpm lint`                                         |
-| **Lint with auto-fix**    | `pnpm lint:fix`                                     |
-| **All unit tests**        | `pnpm test`                                         |
-| **Extension tests**       | `pnpm test:extension`                               |
-| **Webview tests**         | `pnpm test:webview`                                 |
-| **Integration tests**     | `pnpm test:integration`                             |
-| **Single extension test** | `pnpm test:extension ./test/unit/filename.test.ts`  |
-| **Single webview test**   | `pnpm test:webview ./test/webview/filename.test.ts` |
+## Commands
 
-Integration tests launch VS Code and need a display. On headless
-environments (CI, devcontainers) prefix with `xvfb-run -a`:
+- Build: `pnpm build`, `pnpm watch`, `pnpm package`
+- Check: `pnpm typecheck`, `pnpm lint` (`lint:fix`), `pnpm format:check`
+  (`format`)
+- Unit tests: `pnpm test`, or `pnpm test:extension` / `pnpm test:webview`
+  with an optional file path
+- Integration tests: `pnpm test:integration`
+- Storybook: `pnpm storybook`; theme snapshots: `pnpm sync:vscode-themes`
 
-```sh
-xvfb-run -a pnpm test:integration
-```
+Integration tests and the theme sync launch VS Code; on headless machines
+prefix them with `xvfb-run -a`. Run targeted tests while iterating, and
+before handoff run typecheck, lint, format check and the affected tests.
 
-## Testing
+## Guardrails
 
-- Test observable behavior and outputs, not implementation details
-- Descriptive names, minimal setup, no shared mutable state
-- Never mock in end-to-end tests; minimize mocking in unit tests
-- Find root causes, not symptoms - read error messages carefully
-- When mocking constructors (classes) with
-  `vi.mocked(...).mockImplementation()`, use regular functions, not arrow
-  functions. Arrow functions can't be called with `new`.
+- Register `coder.*` commands through `CommandManager` and set context keys
+  through `ContextManager` (`src/vscode/`); lint rejects direct calls.
+- Read `env.remoteAuthority` through `vscodeProposed`; plain `vscode` throws.
+- Never give a `coder.*` setting `"scope": "machine"`; use `application`
+  (the README explains why).
+- Webviews talk to the extension only through the typed IPC helpers.
+- Emit telemetry through the domain's instrumentation class and list new
+  events in `src/instrumentation/EVENTS.md`.
+- Add a `CHANGELOG.md` entry for changes users should know about.
+- Never disable a lint rule without user approval.
 
-```typescript
-// Wrong
-vi.mocked(SomeClass).mockImplementation(() => mock);
-// Correct
-vi.mocked(SomeClass).mockImplementation(function () {
-	return mock;
-});
-```
+## Code style
 
-### Test File Organization
+- Strict TypeScript: no `any`, `as unknown as`, or non-null assertions
+  outside tests. Prefer
+  annotations and narrowing over `as`; fix types at the source.
+- Use the generated API types from `coder/site/src/api/typesGenerated`; never
+  redeclare them.
+- ES6 features, `const` over `let`, async/await over explicit Promises,
+  `_`-prefixed unused variables, wrapped and typed errors.
+- YAGNI. Search for existing code before writing new code, reduce
+  duplication, and delete dead code.
+- Match the surrounding style. Fix bugs when you find them.
+- Names say what code does, never how it's implemented or its history
+  (`JsonParser`, `LegacyHandler`). Use pattern names only when they add
+  clarity, and abbreviate only when obvious.
+- Comments must earn their place: only non-obvious invariants, external
+  constraints or tradeoffs, in one to three lines. Never restate the code,
+  comment where a better name would do, or describe how code changed, and avoid words like "new", "improved" or
+  "legacy". Re-read every comment your diff adds before committing.
+- JSDoc exported functions and types whose contract isn't obvious.
+- No em dashes, en dashes or spaced double hyphens as punctuation in code,
+  comments, strings or docs.
+- Keep each change to one purpose. Don't touch unrelated code, reword
+  existing comments, or delete comments that explain non-obvious behavior.
+- Navigate with the TypeScript language server when available.
 
-```text
-test/
-├── unit/           # Extension unit tests (mirrors src/ structure)
-├── webview/        # Webview unit tests (by package name)
-├── integration/    # VS Code integration tests (uses Mocha, not Vitest)
-├── utils/          # Test utilities that are also tested
-└── mocks/          # Shared test mocks
-```
+## Version control
 
-## Code Style
+- Commit often. Titles use Conventional Commits (`type(scope): message`),
+  imperative, around 70 characters; CI checks PR titles.
+- Never skip hooks. Check `git status` before `git add`. Never force push
+  unless asked.
+- Linear links branches containing `<team>-<number>`: use a Linear ID only
+  for its own issue, and write GitHub issue numbers as `issue-<number>`.
 
-- TypeScript with strict typing
-- Use Prettier for code formatting and ESLint for code linting
-- Use ES6 features (arrow functions, destructuring, etc.)
-- Use `const` by default; `let` only when necessary
-- Never use `any` - use exact types when possible
-- Avoid `as unknown as` - fix the types instead
-- Prefix unused variables with underscore (e.g., `_unused`)
-- Error handling: wrap and type errors appropriately
-- Use async/await for promises, avoid explicit Promise construction where
-  possible
-- Unit test files must be named `*.test.ts` and use Vitest
-- Extension tests go in `./test/unit/<path in src>`
-- Webview tests go in `./test/webview/<package name>/`
-- Never disable ESLint rules without user approval
-
-### Naming and Comments
-
-Names should describe what code does, not how it's implemented.
-
-Comments explain what code does or why it exists:
-
-- Never add comments about what used to be there or how things changed
-- Never use temporal terms like "new", "improved", "refactored", "legacy"
-- Code should be evergreen - describe it as it is
-- Do not add comments when you can instead use proper variable/function
-  naming
-
-### Avoid Unnecessary Changes
-
-When fixing a bug or adding a feature, don't modify code unrelated to your
-task. Unnecessary changes make PRs harder to review and can introduce
-regressions.
-
-Don't reword existing comments or code unless the change is directly
-motivated by your task. Don't delete existing comments that explain
-non-obvious behavior.
-
-When adding tests for existing behavior, read existing tests first to
-understand what's covered. Add cases for uncovered behavior. Edit existing
-tests as needed, but don't change what they verify.
-
-## Version Control
-
-- Commit frequently throughout development
-- Never skip or disable pre-commit hooks
-- Check `git status` before using `git add`
-- Don't use `git push --force` unless explicitly requested
+Read `AGENTS.local.md` when present; it is gitignored, for personal
+instructions.

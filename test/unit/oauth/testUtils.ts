@@ -1,12 +1,14 @@
 import { AxiosError, AxiosHeaders } from "axios";
 import { vi } from "vitest";
 
-import { SecretsManager } from "@/core/secretsManager";
 import { getHeaders } from "@/headers";
 import { OAuthCallback } from "@/oauth/oauthCallback";
+import { MementoManager } from "@/storage/mementoManager";
+import { SecretsManager } from "@/storage/secretsManager";
 
 import {
 	createMockLogger,
+	createMockUser,
 	getAxiosMockAdapter,
 	InMemoryMemento,
 	InMemorySecretStorage,
@@ -62,12 +64,10 @@ export function createMockOAuthMetadata(
 		revocation_endpoint: `${issuer}/oauth2/revoke`,
 		registration_endpoint: `${issuer}/oauth2/register`,
 		scopes_supported: [
-			"workspace:read",
-			"workspace:update",
-			"workspace:start",
-			"workspace:ssh",
-			"workspace:application_connect",
-			"template:read",
+			"coder:workspaces.operate",
+			"coder:workspaces.access",
+			"workspace:create",
+			"user:read",
 			"user:read_personal",
 		],
 		response_types_supported: ["code"],
@@ -123,22 +123,34 @@ export function createBaseTestContext() {
 	vi.mocked(getHeaders).mockResolvedValue({});
 
 	// Constructor sets up vscode.workspace mock
-	const _configurationProvider = new MockConfigurationProvider();
+	const configurationProvider = new MockConfigurationProvider();
 
 	const secretStorage = new InMemorySecretStorage();
 	const memento = new InMemoryMemento();
 	const logger = createMockLogger();
-	const secretsManager = new SecretsManager(secretStorage, memento, logger);
+	const secretsManager = new SecretsManager(
+		secretStorage,
+		new MementoManager(memento),
+		logger,
+	);
 	const oauthCallback = new OAuthCallback(secretStorage, logger);
 
-	/** Sets up default OAuth routes - use explicit routes when asserting on values */
-	const setupOAuthRoutes = () => {
+	/**
+	 * Sets up OAuth routes, defaulting to metadata for TEST_URL. Pass overrides
+	 * to replace individual route responses with a failure or a custom body.
+	 */
+	const setupOAuthRoutes = (
+		metadata: OAuth2AuthorizationServerMetadata = createMockOAuthMetadata(
+			TEST_URL,
+		),
+		overrides: Record<string, unknown> = {},
+	) => {
 		setupAxiosMockRoutes(mockAdapter, {
-			"/.well-known/oauth-authorization-server":
-				createMockOAuthMetadata(TEST_URL),
+			"/.well-known/oauth-authorization-server": metadata,
 			"/oauth2/register": createMockClientRegistration(),
 			"/oauth2/token": createMockTokenResponse(),
-			"/api/v2/users/me": { username: "test-user" },
+			"/api/v2/users/me": createMockUser(),
+			...overrides,
 		});
 	};
 
@@ -148,5 +160,6 @@ export function createBaseTestContext() {
 		oauthCallback,
 		logger,
 		setupOAuthRoutes,
+		configurationProvider,
 	};
 }

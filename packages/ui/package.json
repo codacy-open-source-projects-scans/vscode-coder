@@ -1,0 +1,45 @@
+{
+	"name": "@repo/ui",
+	"version": "1.0.0",
+	"description": "Shared component library for VS Code webviews",
+	"private": true,
+	"type": "module",
+	"sideEffects": [
+		"**/*.css",
+		"./storybook.preview.ts"
+	],
+	"exports": {
+		".": {
+			"types": "./src/index.ts",
+			"default": "./src/index.ts"
+		},
+		"./codicon.css": "./src/codicon.css",
+		"./tokens.css": "./src/tokens.css"
+	},
+	"imports": {
+		"#cx": "./src/cx.ts",
+		"#codicons": "./src/codicons.ts",
+		"#ref": "./src/ref.ts",
+		"#storybook": "./src/storybook.ts"
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@base-ui/react": "catalog:",
+		"@vscode/codicons": "catalog:"
+	},
+	"peerDependencies": {
+		"react": "catalog:",
+		"react-dom": "catalog:"
+	},
+	"devDependencies": {
+		"@storybook/react-vite": "catalog:",
+		"@types/react": "catalog:",
+		"@vscode-elements/react-elements": "catalog:",
+		"react": "catalog:",
+		"react-dom": "catalog:",
+		"storybook": "catalog:",
+		"typescript": "catalog:"
+	}
+}

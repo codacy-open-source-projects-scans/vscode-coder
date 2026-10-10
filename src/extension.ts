@@ -4,39 +4,60 @@ import axios, { isAxiosError } from "axios";
 import { getErrorMessage } from "coder/site/src/api/errors";
 import { createRequire } from "node:module";
 import * as path from "node:path";
+import * as semver from "semver";
 import * as vscode from "vscode";
 
-import { errToStr } from "./api/api-helper";
+import { AnnouncementManager } from "./announcements/manager";
 import { AuthInterceptor } from "./api/authInterceptor";
 import { CoderApi } from "./api/coderApi";
 import { Commands } from "./commands";
-import { ServiceContainer } from "./core/container";
+import { ServiceContainer } from "./container";
 import { DeploymentManager } from "./deployment/deploymentManager";
 import { CertificateError } from "./error/certificateError";
-import { getErrorDetail, toError } from "./error/errorUtils";
+import { errToStr, getErrorDetail, toError } from "./error/normalize";
+import { serverFeatureSet } from "./featureSet";
+import {
+	ActivationTelemetry,
+	type ActivationTracer,
+} from "./instrumentation/activation";
 import { OAuthSessionManager } from "./oauth/sessionManager";
 import { Remote } from "./remote/remote";
 import { getRemoteSshExtension } from "./remote/sshExtension";
 import { registerUriHandler } from "./uri/uriHandler";
-import { initVscodeProposed } from "./vscodeProposed";
-import { ChatPanelProvider } from "./webviews/chat/chatPanelProvider";
+import { initVscodeProposed } from "./vscode/proposed";
 import { TasksPanelProvider } from "./webviews/tasks/tasksPanelProvider";
-import {
-	WorkspaceProvider,
-	WorkspaceQuery,
-} from "./workspace/workspacesProvider";
+import { WorkspacesPanelProvider } from "./webviews/workspaces/workspacesPanelProvider";
+import { WorkspaceStore } from "./webviews/workspaces/workspaceStore";
+import { WorkspaceProvider } from "./workspace/workspacesProvider";
 
 const MY_WORKSPACES_TREE_ID = "myWorkspaces";
+const SHARED_WORKSPACES_TREE_ID = "sharedWorkspaces";
 const ALL_WORKSPACES_TREE_ID = "allWorkspaces";
 
 export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
+	const serviceContainer = new ServiceContainer(ctx);
+	ctx.subscriptions.push(serviceContainer);
+	const activationTelemetry = new ActivationTelemetry(
+		serviceContainer.getTelemetryService(),
+	);
+
+	await activationTelemetry.trace((tracer) =>
+		doActivate(ctx, serviceContainer, tracer),
+	);
+}
+
+async function doActivate(
+	ctx: vscode.ExtensionContext,
+	serviceContainer: ServiceContainer,
+	tracer: ActivationTracer,
+): Promise<void> {
 	// The Remote SSH extension's proposed APIs are used to override the SSH host
 	// name in VS Code itself. It's visually unappealing having a lengthy name!
 	//
 	// This is janky, but that's alright since it provides such minimal
 	// functionality to the extension.
 	//
-	// Cursor and VSCode are covered by ms remote, and the only other is windsurf for now
+	// Cursor and VSCode are covered by ms remote, and the only other are Devin Desktop / Windsurf for now
 	// Means that vscodium is not supported by this for now
 
 	const remoteSshExtension = getRemoteSshExtension();
@@ -59,13 +80,12 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 	// Initialize the global vscodeProposed module for use throughout the extension
 	initVscodeProposed(vscodeProposed);
 
-	const serviceContainer = new ServiceContainer(ctx);
-	ctx.subscriptions.push(serviceContainer);
-
 	const output = serviceContainer.getLogger();
 	const mementoManager = serviceContainer.getMementoManager();
 	const secretsManager = serviceContainer.getSecretsManager();
 	const contextManager = serviceContainer.getContextManager();
+	const commandManager = serviceContainer.getCommandManager();
+	const telemetryService = serviceContainer.getTelemetryService();
 
 	// Migrate auth storage from old flat format to new label-based format
 	await migrateAuthStorage(serviceContainer);
@@ -74,10 +94,17 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 	const startupMode = await mementoManager.getAndClearStartupMode();
 
 	const deployment = await secretsManager.getCurrentDeployment();
+	if (deployment) {
+		serviceContainer.getTelemetryService().setDeploymentUrl(deployment.url);
+	}
+	const deploymentSessionAuth = deployment
+		? await secretsManager.getSessionAuth(deployment.safeHostname)
+		: undefined;
+	tracer.setAuthState(deploymentSessionAuth ? "stored" : "none");
 
 	// Shared handler for auth failures (used by interceptor + session manager)
 	const handleAuthFailure = (): Promise<void> => {
-		deploymentManager.suspendSession();
+		deploymentManager.suspendSession("auth_failure");
 		vscode.window
 			.showWarningMessage(
 				"Session expired. You have been signed out.",
@@ -110,18 +137,17 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 	// in commands that operate on the current login.
 	const client = CoderApi.create(
 		deployment?.url || "",
-		(await secretsManager.getSessionAuth(deployment?.safeHostname ?? ""))
-			?.token,
+		deploymentSessionAuth?.token,
 		output,
+		telemetryService,
 	);
 	ctx.subscriptions.push(client);
 
 	// Handles 401 responses (OAuth and otherwise)
 	const authInterceptor = new AuthInterceptor(
 		client,
-		output,
 		oauthSessionManager,
-		secretsManager,
+		serviceContainer,
 		async () => {
 			await handleAuthFailure();
 			return false;
@@ -129,61 +155,103 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 	);
 	ctx.subscriptions.push(authInterceptor);
 
-	const isAuthenticated = () => contextManager.get("coder.authenticated");
-
-	const myWorkspacesProvider = new WorkspaceProvider(
-		WorkspaceQuery.Mine,
-		client,
-		output,
-		isAuthenticated,
-		5,
-	);
-	ctx.subscriptions.push(myWorkspacesProvider);
-
-	const allWorkspacesProvider = new WorkspaceProvider(
-		WorkspaceQuery.All,
-		client,
-		output,
-		isAuthenticated,
-	);
-	ctx.subscriptions.push(allWorkspacesProvider);
-
-	// createTreeView, unlike registerTreeDataProvider, gives us the tree view API
-	// (so we can see when it is visible) but otherwise they have the same effect.
-	const myWsTree = vscode.window.createTreeView(MY_WORKSPACES_TREE_ID, {
-		treeDataProvider: myWorkspacesProvider,
-	});
-	ctx.subscriptions.push(myWsTree);
-	myWorkspacesProvider.setVisibility(myWsTree.visible);
-	myWsTree.onDidChangeVisibility(
-		(event) => {
-			myWorkspacesProvider.setVisibility(event.visible);
-		},
-		undefined,
-		ctx.subscriptions,
-	);
-
-	const allWsTree = vscode.window.createTreeView(ALL_WORKSPACES_TREE_ID, {
-		treeDataProvider: allWorkspacesProvider,
-	});
-	ctx.subscriptions.push(allWsTree);
-	allWorkspacesProvider.setVisibility(allWsTree.visible);
-	allWsTree.onDidChangeVisibility(
-		(event) => {
-			allWorkspacesProvider.setVisibility(event.visible);
-		},
-		undefined,
-		ctx.subscriptions,
-	);
-
-	// Create deployment manager to centralize deployment state management
 	const deploymentManager = DeploymentManager.create(
 		serviceContainer,
 		client,
 		oauthSessionManager,
-		[myWorkspacesProvider, allWorkspacesProvider],
 	);
 	ctx.subscriptions.push(deploymentManager);
+
+	const announcementManager = new AnnouncementManager(
+		client,
+		deploymentManager.session,
+		mementoManager,
+		output,
+	);
+	ctx.subscriptions.push(announcementManager);
+
+	const myWorkspacesProvider = new WorkspaceProvider(
+		"mine",
+		client,
+		output,
+		deploymentManager.session,
+	);
+	ctx.subscriptions.push(myWorkspacesProvider);
+
+	const allWorkspacesProvider = new WorkspaceProvider(
+		"all",
+		client,
+		output,
+		deploymentManager.session,
+	);
+	ctx.subscriptions.push(allWorkspacesProvider);
+
+	const sharedWorkspacesProvider = new WorkspaceProvider(
+		"shared",
+		client,
+		output,
+		deploymentManager.session,
+		{
+			// Older deployments reject this query; show a message instead of an
+			// empty tree (see `viewsWelcome` in package.json).
+			onQueryRejected: () =>
+				contextManager.set("coder.sharedWorkspacesSupported", false),
+		},
+	);
+	ctx.subscriptions.push(sharedWorkspacesProvider);
+
+	// The deprecated Tasks panel only shows on deployments old enough to
+	// still support it, which requires fetching the deployment version.
+	const updateTasksSupported = async () => {
+		let supported = false;
+		if (deploymentManager.session.current.kind === "signedIn") {
+			try {
+				const buildInfo = await client.getBuildInfo();
+				supported = serverFeatureSet(semver.parse(buildInfo.version)).tasks;
+			} catch (error) {
+				output.warn(
+					"Unable to fetch deployment version for Tasks panel",
+					error,
+				);
+			}
+		}
+		contextManager.set("coder.tasksSupported", supported);
+	};
+	void updateTasksSupported();
+
+	// Re-probe support on session change (login, logout, deployment switch);
+	// the next fetch clears the message again if still unsupported.
+	ctx.subscriptions.push(
+		deploymentManager.session.onDidChange(() => {
+			contextManager.set("coder.sharedWorkspacesSupported", true);
+			void updateTasksSupported();
+		}),
+	);
+
+	// createTreeView, unlike registerTreeDataProvider, gives us the tree view API
+	// (so we can see when it is visible) but otherwise they have the same effect.
+	const registerWorkspaceTreeView = (
+		viewId: string,
+		provider: WorkspaceProvider,
+	) => {
+		const tree = vscode.window.createTreeView(viewId, {
+			treeDataProvider: provider,
+		});
+		ctx.subscriptions.push(tree);
+		provider.setVisibility(tree.visible);
+		tree.onDidChangeVisibility(
+			(event) => provider.setVisibility(event.visible),
+			undefined,
+			ctx.subscriptions,
+		);
+	};
+
+	registerWorkspaceTreeView(MY_WORKSPACES_TREE_ID, myWorkspacesProvider);
+	registerWorkspaceTreeView(
+		SHARED_WORKSPACES_TREE_ID,
+		sharedWorkspacesProvider,
+	);
+	registerWorkspaceTreeView(ALL_WORKSPACES_TREE_ID, allWorkspacesProvider);
 
 	// Register globally available commands.  Many of these have visibility
 	// controlled by contexts, see `when` in the package.json.
@@ -207,6 +275,9 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 		client,
 		output,
 	);
+	commandManager.register("coder.tasks.refresh", () =>
+		tasksPanelProvider.refresh(),
+	);
 	ctx.subscriptions.push(
 		tasksPanelProvider,
 		vscode.window.registerWebviewViewProvider(
@@ -214,123 +285,144 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 			tasksPanelProvider,
 			{ webviewOptions: { retainContextWhenHidden: true } },
 		),
-		vscode.commands.registerCommand("coder.tasks.refresh", () =>
-			tasksPanelProvider.refresh(),
-		),
 		// Refresh tasks panel when deployment changes (login/logout/switch)
 		secretsManager.onDidChangeCurrentDeployment(() =>
 			tasksPanelProvider.refresh(),
 		),
 	);
 
-	// Register Chat embed panel with dependencies
-	const chatPanelProvider = new ChatPanelProvider(client, output);
-	ctx.subscriptions.push(
-		chatPanelProvider,
-		vscode.window.registerWebviewViewProvider(
-			ChatPanelProvider.viewType,
-			chatPanelProvider,
-			{ webviewOptions: { retainContextWhenHidden: true } },
-		),
-		vscode.commands.registerCommand("coder.chat.refresh", () =>
-			chatPanelProvider.refresh(),
-		),
-	);
+	const workspacesPanelEnabled = vscode.workspace
+		.getConfiguration("coder")
+		.get<boolean>("experimental.workspacesPanel", false);
+
+	contextManager.set("coder.workspacesPanelEnabled", workspacesPanelEnabled);
+
+	if (workspacesPanelEnabled) {
+		const workspaceStore = new WorkspaceStore(
+			client,
+			output,
+			deploymentManager.session,
+		);
+		const workspacesPanelProvider = new WorkspacesPanelProvider(
+			ctx.extensionUri,
+			workspaceStore,
+			commands,
+			output,
+		);
+
+		ctx.subscriptions.push(
+			workspaceStore,
+			workspacesPanelProvider,
+			vscode.window.registerWebviewViewProvider(
+				WorkspacesPanelProvider.viewType,
+				workspacesPanelProvider,
+				{ webviewOptions: { retainContextWhenHidden: true } },
+			),
+		);
+	}
 
 	ctx.subscriptions.push(
 		registerUriHandler({
 			serviceContainer,
 			deploymentManager,
 			commands,
-			chatPanelProvider,
 		}),
-		vscode.commands.registerCommand(
-			"coder.login",
-			commands.login.bind(commands),
-		),
-		vscode.commands.registerCommand(
-			"coder.logout",
-			commands.logout.bind(commands),
-		),
-		vscode.commands.registerCommand(
-			"coder.switchDeployment",
-			commands.switchDeployment.bind(commands),
-		),
-		vscode.commands.registerCommand("coder.open", commands.open.bind(commands)),
-		vscode.commands.registerCommand(
-			"coder.openDevContainer",
-			commands.openDevContainer.bind(commands),
-		),
-		vscode.commands.registerCommand(
-			"coder.openFromSidebar",
-			commands.openFromSidebar.bind(commands),
-		),
-		vscode.commands.registerCommand(
-			"coder.openAppStatus",
-			commands.openAppStatus.bind(commands),
-		),
-		vscode.commands.registerCommand(
-			"coder.workspace.update",
-			commands.updateWorkspace.bind(commands),
-		),
-		vscode.commands.registerCommand(
-			"coder.createWorkspace",
-			commands.createWorkspace.bind(commands),
-		),
-		vscode.commands.registerCommand(
-			"coder.navigateToWorkspace",
-			commands.navigateToWorkspace.bind(commands),
-		),
-		vscode.commands.registerCommand(
-			"coder.navigateToWorkspaceSettings",
-			commands.navigateToWorkspaceSettings.bind(commands),
-		),
-		vscode.commands.registerCommand("coder.refreshWorkspaces", () => {
-			void myWorkspacesProvider.fetchAndRefresh();
-			void allWorkspacesProvider.fetchAndRefresh();
-		}),
-		vscode.commands.registerCommand(
-			"coder.viewLogs",
-			commands.viewLogs.bind(commands),
-		),
-		vscode.commands.registerCommand("coder.searchMyWorkspaces", async () =>
-			showTreeViewSearch(MY_WORKSPACES_TREE_ID),
-		),
-		vscode.commands.registerCommand("coder.searchAllWorkspaces", async () =>
-			showTreeViewSearch(ALL_WORKSPACES_TREE_ID),
-		),
-		vscode.commands.registerCommand(
-			"coder.manageCredentials",
-			commands.manageCredentials.bind(commands),
-		),
-		vscode.commands.registerCommand(
-			"coder.applyRecommendedSettings",
-			commands.applyRecommendedSettings.bind(commands),
-		),
-		vscode.commands.registerCommand(
-			"coder.pingWorkspace",
-			commands.pingWorkspace.bind(commands),
-		),
-		vscode.commands.registerCommand(
-			"coder.pingWorkspace:views",
-			commands.pingWorkspace.bind(commands),
-		),
-		vscode.commands.registerCommand(
-			"coder.speedTest",
-			commands.speedTest.bind(commands),
-		),
-		vscode.commands.registerCommand(
-			"coder.speedTest:views",
-			commands.speedTest.bind(commands),
-		),
-		vscode.commands.registerCommand(
-			"coder.supportBundle",
-			commands.supportBundle.bind(commands),
-		),
-		vscode.commands.registerCommand(
-			"coder.supportBundle:views",
-			commands.supportBundle.bind(commands),
-		),
+	);
+
+	commandManager.register("coder.login", commands.login.bind(commands));
+	commandManager.register("coder.logout", commands.logout.bind(commands));
+	commandManager.register(
+		"coder.switchDeployment",
+		commands.switchDeployment.bind(commands),
+	);
+	commandManager.register("coder.open", commands.open.bind(commands));
+	commandManager.register(
+		"coder.openDevContainer",
+		commands.openDevContainer.bind(commands),
+	);
+	commandManager.register(
+		"coder.openFromSidebar",
+		commands.openFromSidebar.bind(commands),
+	);
+	commandManager.register(
+		"coder.openAppStatus",
+		commands.openAppStatus.bind(commands),
+	);
+	commandManager.register(
+		"coder.workspace.update",
+		commands.updateWorkspace.bind(commands),
+	);
+	commandManager.register(
+		"coder.createWorkspace",
+		commands.createWorkspace.bind(commands),
+	);
+	commandManager.register(
+		"coder.navigateToWorkspace",
+		commands.navigateToWorkspace.bind(commands),
+	);
+	commandManager.register(
+		"coder.navigateToWorkspaceSettings",
+		commands.navigateToWorkspaceSettings.bind(commands),
+	);
+	commandManager.register("coder.refreshWorkspaces", () => {
+		// Re-probe in case the deployment was upgraded; the fetch below clears
+		// the message again on rejection.
+		contextManager.set("coder.sharedWorkspacesSupported", true);
+		void myWorkspacesProvider.fetchAndRefresh();
+		void sharedWorkspacesProvider.fetchAndRefresh();
+		void allWorkspacesProvider.fetchAndRefresh();
+	});
+	commandManager.register("coder.viewLogs", commands.viewLogs.bind(commands));
+	commandManager.register(
+		"coder.openSshConfig",
+		commands.openSshConfig.bind(commands),
+	);
+	commandManager.register(
+		"coder.exportTelemetry",
+		commands.exportTelemetry.bind(commands),
+	);
+	commandManager.register(
+		"coder.viewAnnouncements",
+		announcementManager.showAnnouncements.bind(announcementManager),
+	);
+	commandManager.register("coder.searchMyWorkspaces", async () =>
+		showTreeViewSearch(MY_WORKSPACES_TREE_ID),
+	);
+	commandManager.register("coder.searchSharedWorkspaces", async () =>
+		showTreeViewSearch(SHARED_WORKSPACES_TREE_ID),
+	);
+	commandManager.register("coder.searchAllWorkspaces", async () =>
+		showTreeViewSearch(ALL_WORKSPACES_TREE_ID),
+	);
+	commandManager.register(
+		"coder.manageCredentials",
+		commands.manageCredentials.bind(commands),
+	);
+	commandManager.register(
+		"coder.applyRecommendedSettings",
+		commands.applyRecommendedSettings.bind(commands),
+	);
+	commandManager.register(
+		"coder.pingWorkspace",
+		commands.pingWorkspace.bind(commands),
+	);
+	commandManager.register(
+		"coder.pingWorkspace:views",
+		commands.pingWorkspace.bind(commands),
+	);
+	commandManager.register("coder.speedTest", commands.speedTest.bind(commands));
+	commandManager.register(
+		"coder.speedTest:views",
+		commands.speedTest.bind(commands),
+	);
+	commandManager.register("coder.netcheck", commands.netcheck.bind(commands));
+	commandManager.register(
+		"coder.supportBundle",
+		commands.supportBundle.bind(commands),
+	);
+	commandManager.register(
+		"coder.supportBundle:views",
+		commands.supportBundle.bind(commands),
 	);
 
 	const remote = new Remote(serviceContainer, commands, ctx);
@@ -378,26 +470,19 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 			if (details) {
 				ctx.subscriptions.push(details);
 
-				await deploymentManager.setDeploymentIfValid({
+				const deploymentSet = await deploymentManager.verifyAndApplySession({
 					safeHostname: details.safeHostname,
 					url: details.url,
 					token: details.token,
 				});
-
-				// If a deep link stored a chat agent ID before the
-				// remote-authority reload, open it now that the
-				// deployment is configured.
-				const pendingChatId = await mementoManager.getAndClearPendingChatId();
-				if (pendingChatId) {
-					// Enable eagerly so the view is visible before focus.
-					contextManager.set("coder.agentsEnabled", true);
-					chatPanelProvider.openChat(pendingChatId);
-				}
+				tracer.setAuthState(deploymentSet ? "valid_token" : "auth_failed");
 			}
 		} catch (ex) {
 			if (ex instanceof CertificateError) {
 				output.warn(ex.detail);
-				await ex.showNotification("Failed to open workspace", { modal: true });
+				await ex.showNotification("Failed to open workspace", {
+					modal: true,
+				});
 			} else if (isAxiosError(ex)) {
 				const msg = getErrorMessage(ex, "None");
 				const detail = getErrorDetail(ex) || "None";
@@ -438,9 +523,10 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 		contextManager.set("coder.loaded", true);
 	} else if (deployment) {
 		output.info(`Initializing deployment: ${deployment.url}`);
-		deploymentManager
-			.setDeploymentIfValid(deployment)
-			// Failure is logged internally
+		tracer
+			.traceDeploymentInit(() =>
+				deploymentManager.verifyAndApplySession(deployment),
+			)
 			.then((success) => {
 				if (success) {
 					output.info("Deployment authenticated and set");

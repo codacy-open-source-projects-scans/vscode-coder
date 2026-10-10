@@ -4,24 +4,37 @@ import * as vscode from "vscode";
 import { WorkspaceMonitor } from "@/workspace/workspaceMonitor";
 
 import {
+	agent as createAgent,
+	workspace as createWorkspace,
+} from "@repo/mocks";
+
+import { createTestCoderApi } from "../../mocks/coderApi";
+import {
+	createTestTelemetryService,
+	enableLocalTelemetry,
+	TestSink,
+} from "../../mocks/telemetry";
+import {
+	createMockServiceContainer,
 	MockConfigurationProvider,
 	MockContextManager,
 	MockEventStream,
 	MockStatusBarItem,
 	createMockLogger,
+	workspaceWith,
 } from "../../mocks/testHelpers";
-import { workspace as createWorkspace } from "../../mocks/workspace";
 
 import type {
 	ServerSentEvent,
 	Workspace,
+	WorkspaceAgentLog,
+	WorkspaceAgentScript,
 } from "coder/site/src/api/typesGenerated";
 
-import type { CoderApi } from "@/api/coderApi";
-import type { ContextManager } from "@/core/contextManager";
+import type { TelemetryService } from "@/telemetry/service";
 
 function workspaceEvent(
-	overrides?: Parameters<typeof createWorkspace>[0],
+	overrides?: Parameters<typeof createWorkspace>[0] | Workspace,
 ): ServerSentEvent {
 	return { type: "data", data: createWorkspace(overrides) };
 }
@@ -35,27 +48,200 @@ describe("WorkspaceMonitor", () => {
 		vi.resetAllMocks();
 	});
 
-	async function setup(stream = new MockEventStream<ServerSentEvent>()) {
+	async function setup(
+		stream = new MockEventStream<ServerSentEvent>(),
+		telemetry?: TelemetryService,
+		initialWorkspace: Workspace = createWorkspace(),
+	) {
 		const config = new MockConfigurationProvider();
 		const statusBar = new MockStatusBarItem();
 		const contextManager = new MockContextManager();
-		const client = {
-			watchWorkspace: vi.fn().mockResolvedValue(stream),
-			getTemplate: vi.fn().mockResolvedValue({
-				active_version_id: "version-2",
-			}),
-			getTemplateVersion: vi.fn().mockResolvedValue({
-				message: "template v2",
-			}),
-		} as unknown as CoderApi;
+		const logger = createMockLogger();
+		const client = createTestCoderApi({
+			overrides: {
+				watchWorkspace: vi.fn().mockResolvedValue(stream),
+				getTemplate: vi.fn().mockResolvedValue({
+					active_version_id: "version-2",
+				}),
+				getTemplateVersion: vi.fn().mockResolvedValue({
+					message: "template v2",
+				}),
+				getWorkspaceAgentLogs: vi.fn(),
+			},
+		});
 		const monitor = await WorkspaceMonitor.create(
-			createWorkspace(),
+			initialWorkspace,
 			client,
-			createMockLogger(),
-			contextManager as unknown as ContextManager,
+			createMockServiceContainer({
+				telemetry,
+				logger,
+				contextManager,
+			}),
 		);
-		return { monitor, client, stream, config, statusBar, contextManager };
+		return {
+			monitor,
+			client,
+			stream,
+			config,
+			statusBar,
+			contextManager,
+			logger,
+		};
 	}
+
+	describe("telemetry", () => {
+		it("records the initial state, then again on a change", async () => {
+			enableLocalTelemetry();
+			const sink = new TestSink();
+			const stream = new MockEventStream<ServerSentEvent>();
+
+			await setup(
+				stream,
+				createTestTelemetryService(sink),
+				createWorkspace({ latest_build: { status: "running" } }),
+			);
+			stream.pushMessage(
+				workspaceEvent({ latest_build: { status: "stopping" } }),
+			);
+
+			const events = sink.eventsNamed("workspace.state_transitioned");
+			expect(events).toHaveLength(2);
+			expect(events[0].properties).toMatchObject({
+				from: "none",
+				to: "running",
+			});
+			expect(events[1].properties).toMatchObject({
+				from: "running",
+				to: "stopping",
+			});
+		});
+	});
+
+	describe("state logging", () => {
+		it("logs the initial workspace state as observed with flat scalars", async () => {
+			const { logger } = await setup(
+				new MockEventStream<ServerSentEvent>(),
+				undefined,
+				createWorkspace({
+					latest_build: {
+						status: "running",
+						transition: "start",
+						reason: "initiator",
+					},
+				}),
+			);
+
+			expect(logger.info).toHaveBeenCalledWith(
+				expect.stringContaining("state observed"),
+				{
+					from: "none",
+					to: "running",
+					transition: "start",
+					reason: "initiator",
+				},
+			);
+		});
+
+		it("logs subsequent workspace changes as changed", async () => {
+			const { stream, logger } = await setup(
+				new MockEventStream<ServerSentEvent>(),
+				undefined,
+				createWorkspace({ latest_build: { status: "running" } }),
+			);
+
+			stream.pushMessage(
+				workspaceEvent({ latest_build: { status: "stopping" } }),
+			);
+
+			expect(logger.info).toHaveBeenCalledWith(
+				expect.stringContaining("state changed"),
+				expect.objectContaining({ from: "running", to: "stopping" }),
+			);
+		});
+	});
+
+	describe("agent state", () => {
+		it("logs the initial agent state and records telemetry", async () => {
+			enableLocalTelemetry();
+			const sink = new TestSink();
+			const { logger } = await setup(
+				new MockEventStream<ServerSentEvent>(),
+				createTestTelemetryService(sink),
+				workspaceWith("running", [
+					createAgent({
+						name: "main",
+						status: "connecting",
+						lifecycle_state: "created",
+					}),
+				]),
+			);
+
+			expect(logger.info).toHaveBeenCalledWith(
+				expect.stringContaining("agent main state observed"),
+				{
+					statusFrom: "none",
+					statusTo: "connecting",
+					lifecycleFrom: "none",
+					lifecycleTo: "created",
+				},
+			);
+			expect(
+				sink.eventsNamed("workspace.agent.state_transitioned"),
+			).toHaveLength(1);
+		});
+
+		it("logs and records each agent transition across all agents", async () => {
+			enableLocalTelemetry();
+			const sink = new TestSink();
+			const { stream } = await setup(
+				new MockEventStream<ServerSentEvent>(),
+				createTestTelemetryService(sink),
+				workspaceWith("running", [
+					createAgent({ id: "a1", name: "first", status: "connected" }),
+					createAgent({ id: "a2", name: "second", status: "connecting" }),
+				]),
+			);
+
+			stream.pushMessage(
+				workspaceEvent(
+					workspaceWith("running", [
+						createAgent({ id: "a1", name: "first", status: "connected" }),
+						createAgent({ id: "a2", name: "second", status: "connected" }),
+					]),
+				),
+			);
+
+			const events = sink.eventsNamed("workspace.agent.state_transitioned");
+			// Two initial observations plus the one "second" transition.
+			expect(events).toHaveLength(3);
+			expect(events[2].properties).toMatchObject({
+				agent_name: "second",
+				"status.from": "connecting",
+				"status.to": "connected",
+			});
+		});
+
+		it("logs when an agent disappears", async () => {
+			const { stream, logger } = await setup(
+				new MockEventStream<ServerSentEvent>(),
+				undefined,
+				workspaceWith("running", [
+					createAgent({ id: "a1", name: "first" }),
+					createAgent({ id: "a2", name: "second" }),
+				]),
+			);
+
+			stream.pushMessage(
+				workspaceEvent(
+					workspaceWith("running", [createAgent({ id: "a1", name: "first" })]),
+				),
+			);
+
+			expect(logger.info).toHaveBeenCalledWith(
+				expect.stringContaining("agent second removed"),
+			);
+		});
+	});
 
 	describe("websocket lifecycle", () => {
 		it("fires onChange when a workspace message arrives", async () => {
@@ -105,6 +291,19 @@ describe("WorkspaceMonitor", () => {
 			stream.pushMessage(workspaceEvent({ outdated: false }));
 			expect(statusBar.hide).toHaveBeenCalled();
 		});
+
+		it("hides status bar while an outdated workspace is building", async () => {
+			const { stream, statusBar } = await setup();
+
+			stream.pushMessage(
+				workspaceEvent({
+					outdated: true,
+					latest_build: { status: "starting" },
+				}),
+			);
+			expect(statusBar.show).not.toHaveBeenCalled();
+			expect(statusBar.hide).toHaveBeenCalled();
+		});
 	});
 
 	describe("notifications", () => {
@@ -127,7 +326,7 @@ describe("WorkspaceMonitor", () => {
 
 		it("shows deletion notification when deletion is impending", async () => {
 			const { monitor, stream } = await setup();
-			monitor.markInitialSetupComplete();
+			monitor.markInitialSetupComplete("agent-1");
 
 			stream.pushMessage(
 				workspaceEvent({ deleting_at: minutesFromNow(12 * 60) }),
@@ -140,7 +339,7 @@ describe("WorkspaceMonitor", () => {
 
 		it("shows not-running notification after initial setup", async () => {
 			const { monitor, stream } = await setup();
-			monitor.markInitialSetupComplete();
+			monitor.markInitialSetupComplete("agent-1");
 
 			stream.pushMessage(
 				workspaceEvent({ latest_build: { status: "stopped" } }),
@@ -169,7 +368,7 @@ describe("WorkspaceMonitor", () => {
 
 		it("fetches template details for outdated notification", async () => {
 			const { monitor, stream } = await setup();
-			monitor.markInitialSetupComplete();
+			monitor.markInitialSetupComplete("agent-1");
 
 			stream.pushMessage(workspaceEvent({ outdated: true }));
 
@@ -187,7 +386,7 @@ describe("WorkspaceMonitor", () => {
 			stream.pushMessage(workspaceEvent({ outdated: true }));
 			expect(vscode.window.showInformationMessage).not.toHaveBeenCalled();
 
-			monitor.markInitialSetupComplete();
+			monitor.markInitialSetupComplete("agent-1");
 
 			await vi.waitFor(() => {
 				expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(
@@ -213,10 +412,156 @@ describe("WorkspaceMonitor", () => {
 		});
 	});
 
+	describe("startup script failures", () => {
+		type AgentOverrides = Parameters<typeof createAgent>[0];
+
+		const script: WorkspaceAgentScript = {
+			id: "script-1",
+			log_source_id: "source-1",
+			log_path: "",
+			script: "",
+			cron: "",
+			run_on_start: true,
+			run_on_stop: false,
+			start_blocks_login: false,
+			timeout: 0,
+			display_name: "Install deps",
+		};
+
+		async function pushConnectedAgent(
+			agent: AgentOverrides,
+			logs: WorkspaceAgentLog[] = [],
+		) {
+			const { monitor, client, stream } = await setup();
+			vi.mocked(client.getWorkspaceAgentLogs).mockResolvedValue(logs);
+			monitor.markInitialSetupComplete("agent-1");
+			stream.pushMessage(
+				workspaceEvent(workspaceWith("running", [createAgent(agent)])),
+			);
+		}
+
+		it("warns once for the connected agent after startup settles", async () => {
+			const { monitor, stream } = await setup();
+			monitor.markInitialSetupComplete("agent-1");
+			const push = (agent: AgentOverrides) =>
+				stream.pushMessage(
+					workspaceEvent(workspaceWith("running", [createAgent(agent)])),
+				);
+
+			push({
+				lifecycle_state: "starting",
+				scripts: [{ ...script, status: "exit_failure" }],
+			});
+			push({ id: "agent-2", name: "other", lifecycle_state: "start_error" });
+			push({ lifecycle_state: "start_error" });
+			push({ lifecycle_state: "start_error" });
+
+			expect(vscode.window.showWarningMessage).toHaveBeenCalledOnce();
+			expect(vscode.window.showWarningMessage).toHaveBeenCalledWith(
+				"Startup scripts failed on agent main in testuser/test-workspace.",
+				"Show Logs",
+				"Open in Dashboard",
+			);
+		});
+
+		it.each<{ name: string; agent: AgentOverrides; message: string }>([
+			{
+				name: "lists only failed and timed out scripts",
+				agent: {
+					lifecycle_state: "start_timeout",
+					scripts: [
+						{ ...script, status: "exit_failure", exit_code: 2 },
+						{ ...script, display_name: "Dotfiles", status: "timed_out" },
+						{ ...script, display_name: "Ok", status: "ok" },
+						{ ...script, display_name: "Pipes", status: "pipes_left_open" },
+					],
+				},
+				message: `Startup scripts failed on agent main in testuser/test-workspace: "Install deps" (exit code 2), "Dotfiles" (timed out).`,
+			},
+			{
+				name: "warns on a failed script when the agent is ready",
+				agent: {
+					lifecycle_state: "ready",
+					scripts: [{ ...script, status: "exit_failure" }],
+				},
+				message: `Startup script failed on agent main in testuser/test-workspace: "Install deps" (failed).`,
+			},
+			{
+				name: "falls back to the lifecycle state for timeouts",
+				agent: { lifecycle_state: "start_timeout" },
+				message:
+					"Startup scripts on agent main in testuser/test-workspace are taking longer than expected and might still be running.",
+			},
+		])("$name", async ({ agent, message }) => {
+			await pushConnectedAgent(agent);
+
+			expect(vscode.window.showWarningMessage).toHaveBeenCalledWith(
+				message,
+				"Show Logs",
+				"Open in Dashboard",
+			);
+		});
+
+		it("opens a terminal with the logs of each failed script", async () => {
+			const writes = new Map<string, string[]>();
+			vi.mocked(vscode.window.createTerminal).mockImplementation(
+				(opts: vscode.ExtensionTerminalOptions) => {
+					const output: string[] = [];
+					writes.set(opts.name, output);
+					opts.pty.onDidWrite((s) => output.push(s));
+					opts.pty.open?.(undefined);
+					return { show: vi.fn() } as never;
+				},
+			);
+			vi.mocked(vscode.window.showWarningMessage).mockResolvedValue(
+				"Show Logs" as never,
+			);
+			const source = (id: string, display_name: string) => ({
+				workspace_agent_id: "agent-1",
+				id,
+				created_at: "",
+				display_name,
+				icon: "",
+			});
+			const log = (source_id: string, output: string): WorkspaceAgentLog => ({
+				id: 0,
+				created_at: "",
+				level: "info",
+				source_id,
+				output,
+			});
+
+			await pushConnectedAgent(
+				{
+					lifecycle_state: "start_error",
+					log_sources: [
+						source("source-1", "Install deps"),
+						source("source-2", "Dotfiles"),
+					],
+					scripts: [
+						{ ...script, status: "exit_failure", exit_code: 1 },
+						{ ...script, log_source_id: "source-2", status: "ok" },
+					],
+				},
+				[
+					log("source-1", "installing"),
+					log("source-2", "dotfiles ok"),
+					log("source-1", "npm ERR!"),
+				],
+			);
+
+			await vi.waitFor(() => {
+				expect(Object.fromEntries(writes)).toEqual({
+					"Startup Logs: Install deps": ["installing\r\nnpm ERR!"],
+				});
+			});
+		});
+	});
+
 	describe("disableUpdateNotifications", () => {
 		it("suppresses outdated notification but allows other types", async () => {
 			const { monitor, stream, config } = await setup();
-			monitor.markInitialSetupComplete();
+			monitor.markInitialSetupComplete("agent-1");
 			config.set("coder.disableUpdateNotifications", true);
 
 			stream.pushMessage(workspaceEvent({ outdated: true }));
@@ -237,7 +582,7 @@ describe("WorkspaceMonitor", () => {
 
 		it("shows outdated notification after re-enabling", async () => {
 			const { monitor, stream, config } = await setup();
-			monitor.markInitialSetupComplete();
+			monitor.markInitialSetupComplete("agent-1");
 			config.set("coder.disableUpdateNotifications", true);
 
 			stream.pushMessage(workspaceEvent({ outdated: true }));
@@ -258,7 +603,7 @@ describe("WorkspaceMonitor", () => {
 		it("suppresses all notification types", async () => {
 			const { monitor, stream, config } = await setup();
 			config.set("coder.disableNotifications", true);
-			monitor.markInitialSetupComplete();
+			monitor.markInitialSetupComplete("agent-1");
 
 			stream.pushMessage(workspaceEvent({ outdated: true }));
 			stream.pushMessage(
@@ -275,8 +620,16 @@ describe("WorkspaceMonitor", () => {
 			stream.pushMessage(
 				workspaceEvent({ latest_build: { status: "stopped" } }),
 			);
+			stream.pushMessage(
+				workspaceEvent(
+					workspaceWith("running", [
+						createAgent({ lifecycle_state: "start_error" }),
+					]),
+				),
+			);
 
 			expect(vscode.window.showInformationMessage).not.toHaveBeenCalled();
+			expect(vscode.window.showWarningMessage).not.toHaveBeenCalled();
 		});
 
 		it("still updates context and status bar", async () => {

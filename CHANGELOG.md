@@ -9,16 +9,408 @@
 
 ### Added
 
-- Opening a workspace that's already connected in another VS Code window now shows a prompt
-  to **Duplicate Window** (preserving tabs and panels) or **Open Without Folder**, instead of
-  just focusing the existing window with no way to open a second view of the same workspace.
+- Warn when the connected agent's startup scripts fail or time out, with
+  **Show Logs** and **Open in Dashboard** actions. These failures used to appear
+  only in the Coder output channel.
+- Flush the buffered connection logs into the Coder output channel after several
+  consecutive failed reconnect attempts, so the detail leading up to a "hangs on
+  connecting" problem is captured even when the server is simply unreachable and
+  the socket never reaches a terminal failure. The extension keeps retrying until
+  the server is reachable again.
 
 ### Fixed
 
-- The **Coder: Workspace Build** output channel is no longer created when reconnecting to an
-  already-running workspace, so the Output panel doesn't pop open empty.
+- OAuth sign-in now works on deployments that enforce token scopes. Users signed
+  in with OAuth are asked to sign in again once.
+- Revoke OAuth tokens on logout even when their scopes are outdated.
 
-## [v1.14.4-pre](https://github.com/coder/vscode-coder/releases/tag/v1.14.4-pre) 2026-04-20
+## [v1.16.4](https://github.com/coder/vscode-coder/releases/tag/v1.16.4) 2026-09-23
+
+### Added
+
+- Add `coder.connectionLogBuffer.size` to keep recent below-level Coder output
+  channel entries in memory and replay them into the channel when a connection
+  fails terminally or you collect a support bundle, so Support can diagnose
+  connection failures without asking you to reproduce with debug logging on. Set
+  to `0` to disable.
+
+### Fixed
+
+- Stop retrying after an unrecoverable WebSocket close (`1002`/`1003`) and
+  replay the buffered connection logs instead. Close codes never reached the
+  reconnect logic, so these closes retried forever. Server-initiated normal
+  closes (`1000`/`1001`) keep reconnecting.
+- Repair permissions on the Windows SSH config files the extension generates,
+  so connections stop failing with "Bad owner or permissions". Only you,
+  SYSTEM, and Administrators keep access to them. The extension leaves your own
+  SSH config untouched and needs no admin rights.
+- Update a workspace in one build on Coder 2.36 and later. The connection's
+  own autostart could take the build slot between the update's stop and start,
+  so the workspace came back on the template version it already had.
+- Ask whether to connect to the existing version when an update fails, instead
+  of connecting to it with only a warning.
+- Hide the Tasks panel on deployments before 2.29, which do not serve
+  `/api/v2/tasks` and answered every poll with a 404.
+- Remove the CLI download's progress log once the download finishes. A write
+  still in flight could recreate the file after cleanup and leave it behind.
+
+## [v1.16.3](https://github.com/coder/vscode-coder/releases/tag/v1.16.3) 2026-09-14
+
+### Changed
+
+- Store your session token in the OS keyring by default on macOS and Windows,
+  shared with the `coder` CLI: signing in here also signs in the CLI. Requires
+  Coder CLI 2.29.0 or later; Linux and older CLIs keep using a file. To opt
+  out, set `coder.useKeyring` to `false`.
+- Ask whether to sign the `coder` CLI out too when you sign out, or remove
+  credentials with **Coder: Manage Credentials**, and the CLI shares your
+  session.
+- Pass `coder.useKeyring` to the CLI as `--use-keyring`, so it overrides the
+  `CODER_USE_KEYRING` environment variable.
+- Treat the `CODER_CONFIG_DIR` environment variable like `--global-config` in
+  `coder.globalFlags`.
+- Require Coder CLI 2.32.0 or later, up from 2.31.0, to sign in with the CLI's
+  session or share its config directory.
+- Ask before signing in with the `coder` CLI's session when it belongs to a
+  different user.
+- Show **Open Settings** when the CLI cannot store the token at login, and
+  **Show Output** when signing out cannot remove every credential.
+- Group the workspaces view's **...** menu: **Switch Deployment** and
+  **Logout** first, then **Network Check**.
+
+### Fixed
+
+- Pass `--allow-redirects` to Coder CLI 2.38.0 or later, which otherwise
+  refuses a redirected deployment URL and fails `coder login`, `coder logout`,
+  and `coder ssh`.
+
+## [v1.16.2](https://github.com/coder/vscode-coder/releases/tag/v1.16.2) 2026-08-25
+
+### Fixed
+
+- Reopen a workspace on the SSH host it was last opened on. v1.16.1 moved
+  existing workspaces onto a host named after your editor, and an editor
+  remembers a window by its full address, host included, so the workspace
+  looked new: Cursor's chats, your window layout, and anything else kept per
+  workspace appeared to be gone. Nothing was deleted. The host now follows the
+  workspace wherever you open it from: the Coder panel, a dashboard or
+  devcontainer link, or **File > Open Recent**, and whether it opens as a
+  folder or as a multi-root workspace. Only a workspace you have never opened
+  gets your editor's host.
+- Mark the shared `coder-vscode` host as `(legacy)` in **File > Open Recent**,
+  so a workspace listed on both hosts is no longer two identical lines. The
+  folder picker lists each folder once.
+- Look for a workspace's remote logs under the host it opens on when collecting
+  a support bundle for a workspace you are not connected to. The lookup always
+  used a host named after your editor, so a `remote.SSH.serverInstallPath` set
+  for the shared host was missed and the bundle fell back to the default.
+- Serve the shared `coder-vscode` host from one generated SSH config file
+  instead of one per editor, so a connection over it always uses the CLI and
+  credentials of the editor that started it. **Coder: Open Generated SSH
+  Configuration File** can open that file too.
+
+## [v1.16.1](https://github.com/coder/vscode-coder/releases/tag/v1.16.1) 2026-08-24
+
+### Added
+
+- Add a **Coder: Open Generated SSH Configuration File** command that opens
+  this editor's generated workspace hosts file in a read-only editor. A
+  connected window opens its own deployment's file; a local window asks which
+  deployment to open when there are several.
+- Prefix every line in the Coder output channel with a per-session ID, and
+  send that same ID to your deployment and to the `coder` CLI. Searching for
+  it in the logs or a support bundle picks out everything one session did,
+  even when several windows are connected at once.
+- Log workspace, agent, and lifecycle status changes as they happen, including
+  agents that disappear. A slow or failed connection now leaves a record of
+  what the workspace and its agents were doing at the time, instead of only
+  the error at the end.
+
+### Changed
+
+- Write workspace SSH hosts to generated files under your platform's data
+  directory (`coder.coder-remote/ssh`) instead of into your SSH config. Your
+  config now carries only an include of that directory, which moves back to the
+  top on every connection. Because ssh uses the first value it finds for each
+  option, global options in your config, such as a catch-all `Host *`, no
+  longer change how the extension connects. To override the generated options,
+  set them in `coder.sshConfig`, which still takes precedence.
+- Generate one file per editor and deployment, all behind the same include, so
+  VS Code, Cursor, Windsurf, and other forks no longer overwrite one another's
+  workspace hosts. Each fork keeps its own SSH host prefix, and legacy
+  `coder-vscode` authorities are migrated by automatically reopening the window
+  once.
+- Stop aborting the connection with "Unexpected SSH Config Option". The include
+  now sits at the top of your config, so the generated options always take
+  effect and there is nothing left to warn about. Validation of the options
+  your deployment sends is unchanged.
+- The Tasks panel is deprecated. It is now titled **Coder Tasks
+  (Deprecated)**, and is hidden entirely on Coder 2.35 and newer.
+
+### Fixed
+
+- Ignore the SSH config file setting on Antigravity and Windsurf/Devin. They
+  launch ssh without pointing it at a config file, so it always reads
+  `~/.ssh/config`, and honoring the setting wrote the workspace host where the
+  connection never looked.
+- Report a malformed response from your deployment or proxy as an error naming
+  the endpoint that sent it, instead of an unrelated crash later on. Waiting on
+  a workspace build now fails on a bad response rather than hanging forever.
+- Stop showing stale progress in other windows waiting on the same CLI
+  download.
+
+## [v1.16.0](https://github.com/coder/vscode-coder/releases/tag/v1.16.0) 2026-08-06
+
+### Added
+
+- Show active deployment announcements in a megaphone status bar item, with a
+  popup for announcements you haven't seen yet (respecting
+  `coder.disableNotifications`; suppressed announcements highlight the status
+  bar item instead). A new **Coder: View Announcements** command opens the full
+  messages in a markdown preview.
+- Ask for confirmation before creating a support bundle, with a summary of the
+  data it collects.
+- Collect the remote editor's server logs from the workspace in support
+  bundles, alongside the local extension and SSH logs (requires a Coder
+  2.36.0+ deployment).
+
+### Changed
+
+- Filter the Shared Workspaces view with the server-side `shared_with_user`
+  query instead of filtering `shared:true` results on the client, so fewer
+  workspaces are fetched and the view loads faster. Deployments too old to
+  support the new filter now show a message explaining why instead of an
+  empty list.
+- Logging out now revokes the OAuth tokens at the server and warns when locally
+  stored credentials could not be fully removed.
+- Redact more sensitive data from HTTP logs: authorization and cookie headers
+  regardless of casing, OAuth credential fields in request and response bodies,
+  and headers produced by `coder.headerCommand`. Shell command output and the
+  header command's output no longer appear in logs or error messages.
+
+### Fixed
+
+- Reject SSH options sent by the deployment that could run code or change how
+  Coder connects, such as `ProxyCommand`, `LocalCommand`, and `Match`, matching
+  the server's own validation of `--ssh-config-options`. One error reports
+  every rejected option. Options you set yourself, in the `coder.sshConfig`
+  setting or with `coder config-ssh --ssh-option`, stay allowed because your
+  value takes precedence.
+- Check the written SSH config the way OpenSSH reads it: option names are
+  case-insensitive and the first value wins. Every unexpected value is
+  reported in a single dialog.
+- Ask for confirmation before a deep link connects to a deployment you have
+  not logged in to before, and before a token in a link signs you in or
+  switches accounts, naming the accounts involved. A link normally shows at
+  most one of these prompts, and a link that signs in the same user on the
+  same deployment stays silent.
+- Write the SSH config to the file the active Remote-SSH extension actually
+  reads. Windsurf/Devin and Antigravity renamed the `remote.SSH` settings
+  section, so a custom config file set as `remote.devinSSH.configFile`,
+  `remote.windsurfSSH.configFile`, or `remote.antigravitySSH.configFile` was
+  ignored and the workspace host was written to `~/.ssh/config`, where those
+  editors never looked.
+- Apply a 60-second default timeout to REST requests, so requests hung on a
+  half-open TCP connection don't stall pollers forever.
+- Change `coder.binarySource`, `coder.binaryDestination`, `coder.headerCommand`,
+  `coder.tlsCertFile`, `coder.tlsKeyFile`, `coder.tlsCaFile`, `coder.tlsAltHost`,
+  `coder.tlsCertRefreshCommand`, `coder.proxyLogDirectory`, `coder.proxyBypass`,
+  `coder.sshConfig`, `coder.sshFlags`, and `coder.globalFlags` from `machine`
+  to `application` scope (still `ignoreSync`, unchanged from before). This
+  keeps workspace/folder `settings.json` from overriding them (the original
+  SEC-200 goal) while fixing #1032, where a `machine`-scoped value could
+  revert to its default in a remote window.
+- Delete the legacy file-based credentials after migrating them to secret
+  storage, instead of leaving plaintext copies behind.
+- Stop using saved logins that point at a different deployment than the one
+  they were saved for, and warn instead of failing the connection when
+  migrated file-based credentials carry such a mismatch.
+
+## [v1.15.2](https://github.com/coder/vscode-coder/releases/tag/v1.15.2) 2026-06-30
+
+> **Breaking:** API requests now respect `http.proxySupport: off`. Previously
+> the extension applied VS Code's proxy settings (`http.proxy`, `http.noProxy`,
+> `coder.proxyBypass`) to API requests even when `http.proxySupport` was `off`.
+> Now `off` ignores those settings and only proxy environment variables are
+> used. If you set those settings and relied on them while proxy support was
+> `off`, either set `http.proxySupport` to `on` to keep using them, or move the
+> values into the `HTTP_PROXY`/`HTTPS_PROXY` (from `http.proxy`) and `NO_PROXY`
+> (from `http.noProxy`/`coder.proxyBypass`) environment variables.
+
+### Fixed
+
+- Honor `http.proxySupport: off` when deriving proxy settings for SSH and API
+  connections, so VS Code's proxy settings are ignored while inherited proxy
+  environment variables still apply.
+
+## [v1.15.1](https://github.com/coder/vscode-coder/releases/tag/v1.15.1) 2026-06-26
+
+### Added
+
+- New **Coder: Network Check** command to run
+  [`coder netcheck`](https://coder.com/docs/reference/cli/netcheck) from the
+  command palette or the My Workspaces view menu. The report opens in a panel
+  with an overall health banner, any warnings, a connectivity summary (UDP,
+  IPv4/IPv6, NAT mapping, hairpinning, port mapping), per-region DERP/STUN
+  results with latencies, and local interfaces. A View JSON action exposes the
+  raw output. When a slow connection is detected, the network status bar
+  tooltip also links to the network check alongside the latency test, for a
+  deployment-wide view of the network path.
+- Share login with the terminal `coder` CLI by setting `--global-config=<dir>`
+  in `coder.globalFlags`; the extension reads file-based CLI credentials from
+  that directory (requires a deployment on 2.31.0+).
+
+### Changed
+
+- File-based credentials are now written and cleared through `coder login` and
+  `coder logout` rather than by the extension directly. The minimum supported
+  Coder version is now v0.25.0.
+
+- Workspace opens and `coder://` URI handling now log more diagnostics (target
+  workspace, agent, and handoff) to make failed opens easier to trace. URI
+  parameter values, including tokens, are never logged.
+
+### Fixed
+
+- Propagate VS Code's proxy settings (`http.proxy`, `http.noProxy`, and
+  `coder.proxyBypass`) to the SSH environment as `HTTP_PROXY`/`HTTPS_PROXY`/
+  `NO_PROXY`, so the `coder ssh` ProxyCommand connects through the configured
+  proxy whether SSH runs as a child process or in a terminal.
+
+## [v1.15.0](https://github.com/coder/vscode-coder/releases/tag/v1.15.0) 2026-06-12
+
+### Added
+
+- New **Shared Workspaces** view in the Coder sidebar that lists workspaces
+  other users have shared with you, with search and refresh actions, so you
+  can find and open them just like your own.
+- New `coder.alternativeWebUrl` setting to open browser pages (dashboard,
+  workspace pages, login) on a different URL than the one used for API, SSH,
+  and CLI traffic. Useful when the API runs on a browser-restricted port
+  (e.g. 7004) but the web UI is served on a standard one (e.g. 443).
+- Local extension telemetry to help diagnose issues. Events are recorded on
+  this machine only and never sent anywhere; payloads are bounded and never
+  include raw workspace names, paths, queries, or command output. Configure
+  via the new `coder.telemetry.level` setting (`local` by default, `off` to
+  disable); see `coder.telemetry.local` for tunables. Every event, property,
+  and measurement is documented in
+  [EVENTS.md](https://github.com/coder/vscode-coder/blob/main/src/instrumentation/EVENTS.md).
+  Coverage:
+  - **Activation and commands**: extension activation phases and every
+    `coder.*` command invocation, with durations and outcomes.
+  - **Auth and deployment**: login/logout, token refresh, credential
+    store/clear, recovery prompts, and session suspend/recover events.
+  - **CLI**: binary resolution, download and signature verification, and
+    SSH configuration, with durations and typed failure categories.
+  - **Remote setup**: each phase of connecting to a workspace, from auth
+    retrieval and workspace lookup through workspace and agent readiness,
+    SSH config write, and connection handoff.
+  - **Connections**: SSH process discovery/loss/recovery with sampled
+    network stats, and reconnecting WebSocket open/drop/reconnect state
+    transitions.
+  - **Workspaces and HTTP**: workspace and agent state transitions with
+    observed durations, start/update/open flows, and per-route
+    `http.requests` rollups for HTTP health without one event per request.
+- The new **Coder: Export Telemetry** command writes locally recorded
+  telemetry for a selected date range to a file you choose, as a JSON array
+  or an OTLP/JSON zip ready for OpenTelemetry tooling. The OTLP zip includes
+  a `manifest.json` summarizing the export: date range, source file and
+  event counts, per-signal record counts, and the telemetry schema version.
+- **Coder: Create Support Bundle** now captures VS Code-side diagnostics in
+  the bundle: a snapshot of `coder.*` and `remote.*` settings (values that
+  can hold secrets are masked), recent extension and SSH proxy logs across
+  sessions, and the local telemetry files, so a single bundle is usually
+  enough to diagnose an issue.
+- Path-like settings (`coder.binaryDestination`, `coder.tlsCertFile`,
+  `coder.tlsKeyFile`, `coder.tlsCaFile`, `coder.tlsAltHost`,
+  `coder.proxyLogDirectory`) and items in `coder.globalFlags` now support
+  `${env:VAR}`, `${userHome}`, and a leading `~`. For `--flag=value` items
+  in `coder.globalFlags`, the expansion applies to the value half, so
+  `--cfg=~/coder` works.
+
+### Changed
+
+- The Coder CLI is now spawned directly instead of through a shell, so
+  arguments reach the binary as-is. The extension no longer has to
+  shell-escape values by hand. That escaping was error-prone (especially
+  around `cmd.exe` on Windows) and a recurring command-injection risk
+  when deployment-supplied values like workspace names or template
+  parameters contained spaces, quotes, or shell metacharacters.
+
+### Fixed
+
+- Updating a workspace from VS Code no longer hangs when the new template
+  version requires parameters. The extension now prompts for any missing
+  required values through VS Code input boxes and passes them to
+  `coder update` so the CLI runs non-interactively. If the CLI still asks
+  for input, the update fails fast and the workspace falls back to starting
+  on its existing template version with a warning, instead of stalling
+  indefinitely.
+- Updating a workspace on a CLI older than 2.24 (which can't run
+  `coder update` non-interactively) now passes newly-required template
+  parameters into the REST API fallback build, instead of silently omitting
+  them and letting the server reject the build.
+- Updating a workspace now re-prompts for an option or multi-select
+  parameter whose stored value is no longer offered by the new template
+  version, instead of carrying the stale value forward and failing the
+  build. Immutable parameters without a stored value are prompted as well,
+  matching the web dashboard's behavior.
+- Workspaces on hostnames containing `--`, such as internationalized (IDN)
+  domains with Punycode (`xn--`) labels, can now be opened from recent
+  connections. The SSH authority parser previously split these names at the
+  wrong separator and rejected the host as invalid.
+
+## [v1.14.6](https://github.com/coder/vscode-coder/releases/tag/v1.14.6) 2026-05-26
+
+### Changed
+
+- Minimum supported VS Code lowered to 1.105 for Cursor compatibility.
+
+### Removed
+
+- The "Coder Chat (Experimental)" secondary sidebar and its `agents`
+  experiment gate. Deeplinks that still include `chatId` continue to open
+  the workspace; the parameter is now silently ignored.
+
+### Fixed
+
+- Sessions suspended by an mTLS or `coder.headerCommand` failure now
+  auto-recover once the setting is corrected; a 401 from a mid-flight
+  settings change is retried silently with the new settings and fresh
+  headers instead of escalating to an interactive prompt.
+- Logout, deployment switch, or dispose during an in-flight auth verify
+  is no longer overwritten when the verify finishes, and no longer
+  leaves stale deployment data in storage.
+- Cross-window login keeps listening when the first token observed from
+  another window is invalid, so a follow-up valid write still resolves
+  the dialog.
+- Config-change side-effects (reload prompt, recovery, reconnects) fire
+  once after edits settle instead of on every event in a burst.
+
+### Security
+
+- Hardened the configuration scope of security-sensitive settings so that a
+  malicious `.vscode/settings.json` cannot override them (SEC-200). Workspace
+  and folder values are now ignored by VS Code for these settings. This closes
+  a path where a workspace could redirect command execution
+  (`coder.headerCommand`, `coder.tlsCertRefreshCommand`), substitute the CLI
+  binary or its source (`coder.binarySource`, `coder.binaryDestination`,
+  `coder.disableSignatureVerification`, `coder.enableDownloads`), inject
+  CLI/SSH flags (`coder.globalFlags`, `coder.sshFlags`), swap TLS material or
+  disable TLS verification (`coder.tlsCertFile`, `coder.tlsKeyFile`,
+  `coder.tlsCaFile`, `coder.tlsAltHost`, `coder.insecure`), or override
+  identity, networking, and credential storage (`coder.defaultUrl`,
+  `coder.autologin`, `coder.useKeyring`, `coder.proxyBypass`,
+  `coder.proxyLogDirectory`).
+- Path-, command-, and network-dependent settings use `"scope": "machine"`
+  (per-machine, not synced via Settings Sync), while user-wide preferences
+  (`coder.defaultUrl`, `coder.autologin`, `coder.useKeyring`, `coder.insecure`,
+  `coder.disableSignatureVerification`, `coder.enableDownloads`) use
+  `"scope": "application"`, which preserves Settings Sync across your
+  machines while still blocking workspace overrides. This follows VS Code's
+  [recommended scope semantics](https://code.visualstudio.com/api/references/contribution-points#contributes.configuration).
+
+## [v1.14.5](https://github.com/coder/vscode-coder/releases/tag/v1.14.5) 2026-04-30
 
 ### Added
 
@@ -29,21 +421,26 @@
   without symlinking.
 - New **Coder: Speed Test Workspace** command to run
   [`coder speedtest`](https://coder.com/docs/reference/cli/speedtest) from the command palette or
-  workspace sidebar. Choose a running workspace, optionally set the test duration, and open the
-  JSON results directly in VS Code.
+  workspace sidebar. Choose a running workspace, optionally set the test duration, and view results
+  in an interactive throughput chart with hover tooltips, a summary header, and a real-time progress
+  bar while the CLI runs. A View JSON action exposes the raw output.
 - New **Coder: Ping Workspace** command to run
   [`coder ping`](https://coder.com/docs/reference/cli/ping) from the command palette or workspace
   sidebar, with live connectivity diagnostics in a terminal.
 - New **Coder: Create Support Bundle** command to run
   [`coder support bundle`](https://coder.com/docs/reference/cli/support_bundle) from VS Code and
-  save the resulting diagnostics zip for troubleshooting. Available when your deployment supports
-  support bundles.
+  save the resulting diagnostics zip for troubleshooting. The bundle also includes VS Code-side
+  logs (Remote SSH extension, SSH proxy, and extension output channels) for easier debugging.
+  Available when your deployment supports support bundles.
 - Coder SSH connections now default to `ServerAliveInterval=10` and `ServerAliveCountMax=3`,
   helping keep sessions alive through NATs and firewalls while detecting dead connections within
   about 30 seconds.
 - New `coder.networkThreshold.latencyMs` setting (default: 250ms, set to `0` to disable) to warn
   when workspace latency stays high. The network status bar indicator turns yellow and offers quick
   actions to run **Coder: Ping Workspace** or open the setting.
+- Opening a workspace that's already connected in another VS Code window now shows a prompt
+  to **Duplicate Window** (preserving tabs and panels) or **Open Without Folder**, instead of
+  just focusing the existing window with no way to open a second view of the same workspace.
 
 ### Fixed
 
@@ -56,6 +453,13 @@
   during an in-progress update.
 - Workspace build logs now reliably appear in the **Coder: Workspace Build** output channel during
   startup.
+- The **Coder: Workspace Build** output channel is no longer created when reconnecting to an
+  already-running workspace, so the Output panel doesn't pop open empty.
+- **Speed Test**, **Ping**, **Create Support Bundle**, and the app status terminal now refresh
+  the stored credential file (or keyring on supported systems) before each invocation, so they
+  no longer fail with a stale token after the session has been refreshed since the workspace was
+  first opened. mTLS deployments continue to work with an empty token.
+- Cancelling a long-running CLI command no longer surfaces as a misleading CLI failure.
 
 ## [v1.14.3](https://github.com/coder/vscode-coder/releases/tag/v1.14.3) 2026-03-30
 

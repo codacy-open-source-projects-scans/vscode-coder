@@ -5,12 +5,19 @@ import {
 } from "axios";
 import { describe, expect, it, vi } from "vitest";
 
-import { type SecretsManager, type SessionAuth } from "@/core/secretsManager";
+import { InvalidApiResponseError } from "@/api/responseValidation";
 import { DEFAULT_OAUTH_SCOPES } from "@/oauth/constants";
 import { OAuthSessionManager } from "@/oauth/sessionManager";
+import { type SessionAuth } from "@/storage/secretsManager";
 
 import {
-	type createMockLogger,
+	createTestTelemetryService,
+	enableLocalTelemetry,
+	TestSink,
+} from "../../mocks/telemetry";
+import {
+	createMockServiceContainer,
+	createMockUser,
 	setupAxiosMockRoutes,
 } from "../../mocks/testHelpers";
 
@@ -25,8 +32,8 @@ import {
 	TEST_URL,
 } from "./testUtils";
 
-import type { ServiceContainer } from "@/core/container";
 import type { Deployment } from "@/deployment/types";
+import type { TelemetryService } from "@/telemetry/service";
 
 vi.mock("axios", async () => {
 	const actual = await vi.importActual<typeof import("axios")>("axios");
@@ -48,9 +55,9 @@ vi.mock("@/headers", () => ({
 	getHeaderCommand: vi.fn(),
 }));
 
-vi.mock("@/api/utils", async () => {
+vi.mock("@/api/httpAgent", async () => {
 	const actual =
-		await vi.importActual<typeof import("@/api/utils")>("@/api/utils");
+		await vi.importActual<typeof import("@/api/httpAgent")>("@/api/httpAgent");
 	return { ...actual, createHttpAgent: vi.fn() };
 });
 
@@ -58,30 +65,23 @@ const REFRESH_BUFFER_MS = 5 * 60 * 1000; // Tokens refresh 5 minutes before expi
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const BACKGROUND_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
-function createMockServiceContainer(
-	secretsManager: SecretsManager,
-	logger: ReturnType<typeof createMockLogger>,
-): ServiceContainer {
-	return {
-		getSecretsManager: () => secretsManager,
-		getLogger: () => logger,
-	} as ServiceContainer;
-}
-
 function createTestContext(deployment: Deployment = createTestDeployment()) {
 	vi.resetAllMocks();
 
 	const base = createBaseTestContext();
-	const container = createMockServiceContainer(
-		base.secretsManager,
-		base.logger,
-	);
-	const manager = OAuthSessionManager.create(deployment, container);
+	const buildContainer = (telemetry?: TelemetryService) =>
+		createMockServiceContainer({
+			secretsManager: base.secretsManager,
+			logger: base.logger,
+			telemetry,
+		});
+	const manager = OAuthSessionManager.create(deployment, buildContainer());
 
 	/** Sets up OAuth session auth */
 	const setupOAuthSession = async (
 		overrides: {
 			token?: string;
+			username?: string;
 			refreshToken?: string;
 			expiryMs?: number;
 			scope?: string;
@@ -90,6 +90,7 @@ function createTestContext(deployment: Deployment = createTestDeployment()) {
 		await base.secretsManager.setSessionAuth(TEST_HOSTNAME, {
 			url: TEST_URL,
 			token: overrides.token ?? "access-token",
+			username: overrides.username,
 			oauth: {
 				refresh_token: overrides.refreshToken ?? "refresh-token",
 				expiry_timestamp: Date.now() + (overrides.expiryMs ?? ONE_HOUR_MS),
@@ -102,7 +103,8 @@ function createTestContext(deployment: Deployment = createTestDeployment()) {
 	const createManager = (
 		d: Deployment = deployment,
 		onAuthRequired: () => Promise<void> = () => Promise.resolve(),
-	) => OAuthSessionManager.create(d, container, onAuthRequired);
+		telemetry?: TelemetryService,
+	) => OAuthSessionManager.create(d, buildContainer(telemetry), onAuthRequired);
 
 	/**
 	 * Sets up a complete OAuth operation test context.
@@ -110,12 +112,7 @@ function createTestContext(deployment: Deployment = createTestDeployment()) {
 	 */
 	const setupForOAuthOperation = async (
 		routes: Record<string, unknown>,
-		sessionOverrides: {
-			token?: string;
-			refreshToken?: string;
-			expiryMs?: number;
-			scope?: string;
-		} = {},
+		sessionOverrides: Parameters<typeof setupOAuthSession>[0] = {},
 	) => {
 		await setupOAuthSession(sessionOverrides);
 		await base.secretsManager.setOAuthClientRegistration(
@@ -167,7 +164,10 @@ describe("OAuthSessionManager", () => {
 			},
 			{
 				name: "returns false when session auth has no OAuth data",
-				auth: { url: TEST_URL, token: "session-token" },
+				auth: {
+					url: TEST_URL,
+					token: "session-token",
+				},
 				expected: false,
 			},
 		])("$name", async ({ auth, expected }) => {
@@ -191,46 +191,80 @@ describe("OAuthSessionManager", () => {
 			);
 		});
 
-		it("refreshes token successfully", async () => {
-			const { secretsManager, mockAdapter, manager, setupOAuthSession } =
+		it("refreshes the token and stores the username it authenticates", async () => {
+			const { secretsManager, manager, setupForOAuthOperation } =
 				createTestContext();
-
-			await setupOAuthSession({ token: "old-token" });
-			await secretsManager.setOAuthClientRegistration(
-				TEST_HOSTNAME,
-				createMockClientRegistration(),
+			await setupForOAuthOperation(
+				{
+					"/oauth2/token": createMockTokenResponse({
+						access_token: "refreshed-token",
+					}),
+					"/api/v2/users/me": createMockUser({ username: "refreshed-user" }),
+				},
+				{ token: "old-token" },
 			);
 
-			setupAxiosMockRoutes(mockAdapter, {
-				"/.well-known/oauth-authorization-server":
-					createMockOAuthMetadata(TEST_URL),
-				"/oauth2/token": createMockTokenResponse({
-					access_token: "refreshed-token",
-				}),
-			});
-
 			const result = await manager.refreshToken();
+
 			expect(result.access_token).toBe("refreshed-token");
+			expect(await secretsManager.getSessionAuth(TEST_HOSTNAME)).toMatchObject({
+				token: "refreshed-token",
+				username: "refreshed-user",
+			});
+		});
+
+		it("keeps the stored username when the user lookup fails", async () => {
+			const { secretsManager, manager, setupForOAuthOperation } =
+				createTestContext();
+			// No users/me route, so the lookup after the refresh fails.
+			await setupForOAuthOperation(
+				{
+					"/oauth2/token": createMockTokenResponse({
+						access_token: "refreshed-token",
+					}),
+				},
+				{ username: "existing-user" },
+			);
+
+			await manager.refreshToken();
+
+			expect(await secretsManager.getSessionAuth(TEST_HOSTNAME)).toMatchObject({
+				token: "refreshed-token",
+				username: "existing-user",
+			});
+		});
+
+		it("rejects a token response without an access token", async () => {
+			const { manager, setupForOAuthOperation } = createTestContext();
+			await setupForOAuthOperation(
+				{
+					"/oauth2/token": { token_type: "Bearer" },
+					"/api/v2/users/me": createMockUser(),
+				},
+				{ token: "old-token" },
+			);
+
+			await expect(manager.refreshToken()).rejects.toThrow(
+				InvalidApiResponseError,
+			);
 		});
 	});
 
 	describe("getStoredTokens validation", () => {
-		it("returns undefined when URL mismatches", async () => {
+		it("returns undefined when the URL differs on the same hostname", async () => {
 			const { secretsManager, manager } = createTestContext();
 
-			// Manually set auth with different URL (can't use helper)
 			await secretsManager.setSessionAuth(TEST_HOSTNAME, {
-				url: "https://different-coder.example.com",
+				url: `${TEST_URL}:8443`,
 				token: "access-token",
 				oauth: {
 					refresh_token: "refresh-token",
 					expiry_timestamp: Date.now() + ONE_HOUR_MS,
-					scope: "",
+					scope: DEFAULT_OAUTH_SCOPES,
 				},
 			});
 
-			const result = await manager.isLoggedInWithOAuth();
-			expect(result).toBe(false);
+			expect(await manager.isLoggedInWithOAuth()).toBe(false);
 		});
 	});
 
@@ -426,22 +460,60 @@ describe("OAuthSessionManager", () => {
 		});
 	});
 
-	describe("revokeRefreshToken", () => {
-		it("revokes token via revocation endpoint", async () => {
+	describe("revokeTokens", () => {
+		it("revokes the refresh and access tokens", async () => {
 			const { manager, setupForOAuthOperation } = createTestContext();
 
-			let revokedToken: string | undefined;
+			const revoked: Array<{ token: string | null; hint: string | null }> = [];
 			await setupForOAuthOperation({
 				"/oauth2/revoke": (config: InternalAxiosRequestConfig) => {
 					const params = new URLSearchParams(config.data as string);
-					revokedToken = params.get("token") ?? undefined;
+					revoked.push({
+						token: params.get("token"),
+						hint: params.get("token_type_hint"),
+					});
 					return {};
 				},
 			});
 
-			await manager.revokeRefreshToken();
+			await manager.revokeTokens();
 
-			expect(revokedToken).toBe("refresh-token");
+			expect(revoked).toEqual([
+				{ token: "refresh-token", hint: "refresh_token" },
+				{ token: "access-token", hint: "access_token" },
+			]);
+		});
+
+		it("revokes tokens with outdated scopes", async () => {
+			const { manager, setupForOAuthOperation } = createTestContext();
+			const revoke = vi.fn(() => ({}));
+			await setupForOAuthOperation(
+				{ "/oauth2/revoke": revoke },
+				{ scope: "workspace:read" },
+			);
+
+			await manager.revokeTokens();
+
+			expect(revoke).toHaveBeenCalledTimes(2);
+		});
+
+		it("does not throw when revocation fails", async () => {
+			const { manager, setupForOAuthOperation } = createTestContext();
+
+			await setupForOAuthOperation({
+				"/oauth2/revoke": () => {
+					throw new Error("revocation endpoint unavailable");
+				},
+			});
+
+			await expect(manager.revokeTokens()).resolves.toBeUndefined();
+		});
+
+		it("is a no-op without stored tokens", async () => {
+			const { manager, mockAdapter } = createTestContext();
+
+			await expect(manager.revokeTokens()).resolves.toBeUndefined();
+			expect(mockAdapter).not.toHaveBeenCalled();
 		});
 	});
 
@@ -472,13 +544,83 @@ describe("OAuthSessionManager", () => {
 				oauth: {
 					refresh_token: "refresh-token",
 					expiry_timestamp: Date.now() + ONE_HOUR_MS,
-					// workspace:* covers workspace:read, workspace:update, etc.
-					scope: "workspace:* template:read user:read_personal",
+					// workspace:* and user:* cover the low-level scopes
+					scope:
+						"coder:workspaces.operate coder:workspaces.access workspace:* user:*",
 				},
 			});
 
 			const result = await manager.isLoggedInWithOAuth();
 			expect(result).toBe(true);
+		});
+
+		it("accepts coder:all", async () => {
+			const { manager, setupOAuthSession } = createTestContext();
+			await setupOAuthSession({ scope: "coder:all" });
+
+			expect(await manager.isLoggedInWithOAuth()).toBe(true);
+		});
+	});
+
+	describe("telemetry", () => {
+		const setupWithSink = async (
+			tokenEndpoint: unknown = createMockTokenResponse({ access_token: "new" }),
+		) => {
+			enableLocalTelemetry();
+			const sink = new TestSink();
+			const ctx = createTestContext();
+			const manager = ctx.createManager(
+				createTestDeployment(),
+				() => Promise.resolve(),
+				createTestTelemetryService(sink),
+			);
+			await ctx.setupForOAuthOperation({ "/oauth2/token": tokenEndpoint });
+			return { manager, sink };
+		};
+
+		it.each(["reactive", "background"] as const)(
+			"emits auth.token_refresh with trigger=%s",
+			async (trigger) => {
+				const { manager, sink } = await setupWithSink();
+
+				await manager.refreshToken(trigger);
+
+				const event = sink.expectOne("auth.token_refresh.completed");
+				expect(event.properties).toMatchObject({ trigger, result: "success" });
+				expect(event.measurements.durationMs).toEqual(expect.any(Number));
+			},
+		);
+
+		it("emits auth.token_refresh with result=error when refresh fails", async () => {
+			const { manager, sink } = await setupWithSink(
+				createOAuthAxiosError("invalid_grant"),
+			);
+
+			await expect(manager.refreshToken("reactive")).rejects.toThrow();
+
+			const event = sink.expectOne("auth.token_refresh.completed");
+			expect(event.properties).toMatchObject({
+				trigger: "reactive",
+				result: "error",
+			});
+			expect(event.measurements.durationMs).toEqual(expect.any(Number));
+		});
+
+		it("emits auth.token_refresh.deduped for callers that join an in-flight refresh", async () => {
+			const { manager, sink } = await setupWithSink();
+
+			const [first, second] = await Promise.all([
+				manager.refreshToken("background"),
+				manager.refreshToken("reactive"),
+			]);
+
+			expect(first).toBe(second);
+			expect(sink.eventsNamed("auth.token_refresh.completed")).toHaveLength(1);
+			expect(
+				sink.expectOne("auth.token_refresh.deduped").properties,
+			).toMatchObject({
+				trigger: "reactive",
+			});
 		});
 	});
 });

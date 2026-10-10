@@ -2,34 +2,48 @@ packages:
   - packages/*
 
 catalog:
-  "@rolldown/plugin-babel": ^0.2.3
-  "@tanstack/react-query": ^5.100.5
-  "@types/react": ^19.2.14
-  "@types/react-dom": ^19.2.3
+  "@base-ui/react": ^1.8.0
+  "@rolldown/plugin-babel": ^0.2.4
+  "@storybook/addon-a11y": ^10.6.1
+  "@storybook/addon-docs": ^10.6.1
+  "@storybook/react-vite": ^10.6.1
+  "@tanstack/react-query": ^5.104.1
+  "@testing-library/user-event": ^14.6.7
+  "@types/react": ^19.3.0
+  "@types/react-dom": ^19.3.0
   "@types/vscode-webview": ^1.57.5
-  "@vitejs/plugin-react": ^6.0.1
+  "@vitejs/plugin-react": ^6.1.1
   "@vscode-elements/react-elements": ^2.4.0
-  "@vscode/codicons": ^0.0.45
+  "@vscode/codicons": 0.0.46-24
   babel-plugin-react-compiler: ^1.0.0
-  coder: github:coder/coder#main
-  date-fns: ^4.1.0
-  react: ^19.2.5
-  react-dom: ^19.2.5
-  typescript: ^6.0.3
-  vite: ^8.0.10
+  coder: github:coder/coder#22f4284f8fa67bc3af6fc38e0079616d39128566 # v2.37.1
+  date-fns: ^4.4.0
+  react: ^19.3.0
+  react-dom: ^19.3.0
+  storybook: ^10.6.1
+  storybook-addon-pseudo-states: ^10.6.1
+  # typescript stays on the 6.0 API for typescript-eslint; TypeScript 7 runs `tsc`.
+  # https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/
+  typescript: npm:@typescript/typescript6@^6.0.2
+  vite: ^8.3.2
 
 catalogMode: strict
+
+dedupePeers: true
+
+allowBuilds:
+  "@vscode/vsce-sign": true
+  # Only win32-arm64 lacks a prebuild, and its JavaScript fallback is fine.
+  bufferutil: false
+  electron: true
+  esbuild: true
+  keytar: false
+  odiff-bin: true
+  unrs-resolver: true
+  utf-8-validate: false
 
 overrides:
   "@vscode-elements/elements": ^2.5.1
 
-ignoredBuiltDependencies:
-  - keytar
-
-onlyBuiltDependencies:
-  - "@vscode/vsce-sign"
-  - bufferutil
-  - electron
-  - esbuild
-  - unrs-resolver
-  - utf-8-validate
+# Opt out of the release-age quarantine.
+minimumReleaseAge: 0

@@ -12,25 +12,24 @@ import {
 	isStableTask,
 	TasksApi,
 	type CreateTaskParams,
-	type IpcRequest,
-	type IpcResponse,
-	type NotificationDef,
 	type TaskDetails,
 	type TaskLogs,
 	type TaskTemplate,
 } from "@repo/shared";
 
-import { errToStr } from "../../api/api-helper";
 import { type CoderApi } from "../../api/coderApi";
+import { HttpStatusCode } from "../../api/httpStatusCode";
 import {
 	LazyStream,
 	streamAgentLogs,
 	streamBuildLogs,
 } from "../../api/workspace";
-import { toError } from "../../error/errorUtils";
+import { openInBrowser } from "../../common/url";
+import { errToStr } from "../../error/normalize";
 import { type Logger } from "../../logging/logger";
-import { vscodeProposed } from "../../vscodeProposed";
-import { getWebviewHtml } from "../util";
+import { vscodeProposed } from "../../vscode/proposed";
+import { dispatchWebviewMessage, notifyWebview } from "../dispatch";
+import { getWebviewHtml } from "../html";
 
 import type {
 	Preset,
@@ -40,37 +39,12 @@ import type {
 	WorkspaceAgentLog,
 } from "coder/site/src/api/typesGenerated";
 
-/** Build URL to view task build logs in Coder dashboard */
-function getTaskBuildUrl(baseUrl: string, task: Task): string {
+/** Build the dashboard path for a task's build logs. */
+function getTaskBuildPath(task: Task): string {
 	if (task.workspace_name && task.workspace_build_number) {
-		return `${baseUrl}/@${task.owner_name}/${task.workspace_name}/builds/${task.workspace_build_number}`;
+		return `/@${task.owner_name}/${task.workspace_name}/builds/${task.workspace_build_number}`;
 	}
-	return `${baseUrl}/tasks/${task.owner_name}/${task.id}`;
-}
-
-/** Check if message is a request (has requestId) */
-function isIpcRequest(msg: unknown): msg is IpcRequest {
-	return (
-		typeof msg === "object" &&
-		msg !== null &&
-		"requestId" in msg &&
-		typeof (msg as IpcRequest).requestId === "string" &&
-		"method" in msg &&
-		typeof (msg as IpcRequest).method === "string"
-	);
-}
-
-/** Check if message is a command (has method but no requestId) */
-function isIpcCommand(
-	msg: unknown,
-): msg is { method: string; params?: unknown } {
-	return (
-		typeof msg === "object" &&
-		msg !== null &&
-		!("requestId" in msg) &&
-		"method" in msg &&
-		typeof (msg as { method: string }).method === "string"
-	);
+	return `/tasks/${task.owner_name}/${task.id}`;
 }
 
 export class TasksPanelProvider
@@ -78,12 +52,15 @@ export class TasksPanelProvider
 {
 	public static readonly viewType = "coder.tasksPanel";
 
+	/** Methods whose handler errors pop a dialog; others are logged only. */
 	private static readonly USER_ACTION_METHODS = new Set([
 		TasksApi.pauseTask.method,
 		TasksApi.resumeTask.method,
 		TasksApi.deleteTask.method,
 		TasksApi.downloadLogs.method,
 		TasksApi.sendTaskMessage.method,
+		TasksApi.viewInCoder.method,
+		TasksApi.viewLogs.method,
 	]);
 
 	private view?: vscode.WebviewView;
@@ -131,12 +108,12 @@ export class TasksPanelProvider
 	) {}
 
 	public showCreateForm(): void {
-		this.notify(TasksApi.showCreateForm);
+		notifyWebview(this.view?.webview, TasksApi.showCreateForm);
 	}
 
 	public refresh(): void {
 		this.cachedLogs = undefined;
-		this.notify(TasksApi.refresh);
+		notifyWebview(this.view?.webview, TasksApi.refresh);
 	}
 
 	resolveWebviewView(
@@ -181,56 +158,16 @@ export class TasksPanelProvider
 		});
 	}
 
-	private async handleMessage(message: unknown): Promise<void> {
-		if (isIpcRequest(message)) {
-			await this.handleRequest(message);
-		} else if (isIpcCommand(message)) {
-			await this.handleCommand(message);
-		}
-	}
-
-	private async handleRequest(message: IpcRequest): Promise<void> {
-		const { requestId, method, params } = message;
-
-		try {
-			const handler = this.requestHandlers[method];
-			if (!handler) {
-				throw new Error(`Unknown method: ${method}`);
-			}
-			const data = await handler(params);
-			this.sendResponse({ requestId, method, success: true, data });
-		} catch (err) {
-			const errorMessage = toError(err).message;
-			this.logger.warn(`Request ${method} failed`, err);
-			this.sendResponse({
-				requestId,
-				method,
-				success: false,
-				error: errorMessage,
-			});
-			if (TasksPanelProvider.USER_ACTION_METHODS.has(method)) {
-				vscode.window.showErrorMessage(errorMessage);
-			}
-		}
-	}
-
-	private async handleCommand(message: {
-		method: string;
-		params?: unknown;
-	}): Promise<void> {
-		const { method, params } = message;
-
-		try {
-			const handler = this.commandHandlers[method];
-			if (!handler) {
-				throw new Error(`Unknown command: ${method}`);
-			}
-			await handler(params);
-		} catch (err) {
-			const errorMessage = toError(err).message;
-			this.logger.warn(`Command ${method} failed`, err);
-			vscode.window.showErrorMessage(errorMessage);
-		}
+	private handleMessage(message: unknown): Promise<void> {
+		return dispatchWebviewMessage(
+			message,
+			{ requests: this.requestHandlers, commands: this.commandHandlers },
+			this.view?.webview,
+			{
+				logger: this.logger,
+				userActions: TasksPanelProvider.USER_ACTION_METHODS,
+			},
+		);
 	}
 
 	private async handleGetTaskDetails(taskId: string): Promise<TaskDetails> {
@@ -314,7 +251,10 @@ export class TasksPanelProvider
 			await taskApiCall();
 			await this.refreshAndNotifyTask(taskId);
 		} catch (err) {
-			if (isAxiosError(err) && err.response?.status === 404) {
+			if (
+				isAxiosError(err) &&
+				err.response?.status === HttpStatusCode.NOT_FOUND
+			) {
 				this.useLegacyPauseResume = true;
 				return this.legacyPauseOrResume(taskId, legacyCall);
 			}
@@ -350,7 +290,8 @@ export class TasksPanelProvider
 		} catch (err) {
 			if (
 				isAxiosError(err) &&
-				(err.response?.status === 409 || err.response?.status === 400)
+				(err.response?.status === HttpStatusCode.CONFLICT ||
+					err.response?.status === HttpStatusCode.BAD_REQUEST)
 			) {
 				throw new Error(`Agent is not ready for messages (${errToStr(err)})`, {
 					cause: err,
@@ -363,21 +304,19 @@ export class TasksPanelProvider
 	}
 
 	private async handleViewInCoder(taskId: string): Promise<void> {
-		const baseUrl = this.client.getHost();
-		if (!baseUrl) return;
+		const connUrl = this.client.getHost();
+		if (!connUrl) return;
 
 		const task = await this.client.getTask("me", taskId);
-		vscode.env.openExternal(
-			vscode.Uri.parse(`${baseUrl}/tasks/${task.owner_name}/${task.id}`),
-		);
+		await openInBrowser(connUrl, `/tasks/${task.owner_name}/${task.id}`);
 	}
 
 	private async handleViewLogs(taskId: string): Promise<void> {
-		const baseUrl = this.client.getHost();
-		if (!baseUrl) return;
+		const connUrl = this.client.getHost();
+		if (!connUrl) return;
 
 		const task = await this.client.getTask("me", taskId);
-		vscode.env.openExternal(vscode.Uri.parse(getTaskBuildUrl(baseUrl, task)));
+		await openInBrowser(connUrl, getTaskBuildPath(task));
 	}
 
 	private async handleDownloadLogs(taskId: string): Promise<void> {
@@ -423,7 +362,7 @@ export class TasksPanelProvider
 			const clean = stripAnsi(line);
 			// Skip lines that were purely ANSI codes, but keep intentional blank lines.
 			if (line.length > 0 && clean.length === 0) return;
-			this.notify(TasksApi.workspaceLogsAppend, [clean]);
+			notifyWebview(this.view?.webview, TasksApi.workspaceLogsAppend, [clean]);
 		};
 
 		const onStreamClose = () => {
@@ -471,7 +410,10 @@ export class TasksPanelProvider
 		try {
 			return await this.client.getTasks({ owner: "me" });
 		} catch (err) {
-			if (isAxiosError(err) && err.response?.status === 404) {
+			if (
+				isAxiosError(err) &&
+				err.response?.status === HttpStatusCode.NOT_FOUND
+			) {
 				return null;
 			}
 			throw err;
@@ -482,7 +424,7 @@ export class TasksPanelProvider
 		try {
 			const tasks = await this.fetchTasks();
 			if (tasks !== null) {
-				this.notify(TasksApi.tasksUpdated, tasks);
+				notifyWebview(this.view?.webview, TasksApi.tasksUpdated, tasks);
 			}
 		} catch (err) {
 			this.logger.warn("Failed to refresh tasks after action", err);
@@ -492,7 +434,7 @@ export class TasksPanelProvider
 	private async refreshAndNotifyTask(taskId: string): Promise<void> {
 		try {
 			const task = await this.client.getTask("me", taskId);
-			this.notify(TasksApi.taskUpdated, task);
+			notifyWebview(this.view?.webview, TasksApi.taskUpdated, task);
 		} catch (err) {
 			this.logger.warn("Failed to refresh task after action", err);
 		}
@@ -535,7 +477,10 @@ export class TasksPanelProvider
 				}),
 			);
 		} catch (err) {
-			if (isAxiosError(err) && err.response?.status === 404) {
+			if (
+				isAxiosError(err) &&
+				err.response?.status === HttpStatusCode.NOT_FOUND
+			) {
 				return null;
 			}
 			throw err;
@@ -573,26 +518,15 @@ export class TasksPanelProvider
 				snapshotAt: response.snapshot_at,
 			};
 		} catch (err) {
-			if (isAxiosError(err) && err.response?.status === 409) {
+			if (
+				isAxiosError(err) &&
+				err.response?.status === HttpStatusCode.CONFLICT
+			) {
 				return { status: "not_available" };
 			}
 			this.logger.warn("Failed to fetch task logs", err);
 			return { status: "error" };
 		}
-	}
-
-	private sendResponse(response: IpcResponse): void {
-		this.view?.webview.postMessage(response);
-	}
-
-	private notify<D>(
-		def: NotificationDef<D>,
-		...args: D extends void ? [] : [data: D]
-	): void {
-		this.view?.webview.postMessage({
-			type: def.method,
-			...(args.length > 0 ? { data: args[0] } : {}),
-		});
 	}
 
 	dispose(): void {

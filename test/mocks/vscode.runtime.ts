@@ -65,29 +65,92 @@ export class ThemeColor {
 	}
 }
 
+export class TreeItem {
+	id?: string;
+	label?: string;
+	description?: string;
+	tooltip?: string;
+	contextValue?: string;
+	command?: unknown;
+	iconPath?: unknown;
+
+	constructor(
+		label: string,
+		public collapsibleState?: number,
+	) {
+		this.label = label;
+	}
+}
+
 export class Uri {
 	constructor(
 		public scheme: string,
 		public path: string,
+		public authority = "",
+		public query = "",
+		public fragment = "",
 	) {}
+	get fsPath(): string {
+		return this.path;
+	}
 	static file(p: string) {
 		return new Uri("file", p);
 	}
-	static parse(v: string) {
-		if (v.startsWith("file://")) {
-			return Uri.file(v.slice("file://".length));
+	static from(components: {
+		scheme: string;
+		path?: string;
+		authority?: string;
+		query?: string;
+		fragment?: string;
+	}) {
+		return new Uri(
+			components.scheme,
+			components.path ?? "",
+			components.authority ?? "",
+			components.query ?? "",
+			components.fragment ?? "",
+		);
+	}
+	with(change: {
+		scheme?: string;
+		path?: string;
+		authority?: string;
+		query?: string;
+		fragment?: string;
+	}) {
+		return new Uri(
+			change.scheme ?? this.scheme,
+			change.path ?? this.path,
+			change.authority ?? this.authority,
+			change.query ?? this.query,
+			change.fragment ?? this.fragment,
+		);
+	}
+	static parse(value: string) {
+		if (value.startsWith("file://")) {
+			return Uri.file(value.slice("file://".length));
 		}
-		const [scheme, ...rest] = v.split(":");
+		const [scheme, ...rest] = value.split(":");
 		return new Uri(scheme, rest.join(":"));
 	}
 	toString() {
-		return this.scheme === "file"
-			? `file://${this.path}`
-			: `${this.scheme}:${this.path}`;
+		if (!this.authority && !this.query && !this.fragment) {
+			return this.scheme === "file"
+				? `file://${this.path}`
+				: `${this.scheme}:${this.path}`;
+		}
+		const authority = this.authority ? `//${this.authority}` : "";
+		const query = this.query ? `?${this.query}` : "";
+		const fragment = this.fragment ? `#${this.fragment}` : "";
+		return `${this.scheme}:${authority}${this.path}${query}${fragment}`;
 	}
 	static joinPath(base: Uri, ...paths: string[]) {
-		const sep = base.path.endsWith("/") ? "" : "/";
-		return new Uri(base.scheme, base.path + sep + paths.join("/"));
+		const head = base.path.replace(/\/+$/, "");
+		const tail = paths
+			.map((p) => p.replace(/^\/+|\/+$/g, ""))
+			.filter(Boolean)
+			.join("/");
+		return base.with({ path: tail ? `${head}/${tail}` : head });
 	}
 }
 
@@ -111,6 +174,28 @@ export class EventEmitter<T> {
 	}
 }
 
+/** Mock CancellationTokenSource that matches the vscode API. */
+export class CancellationTokenSource {
+	private readonly emitter = new EventEmitter<void>();
+
+	readonly token = {
+		isCancellationRequested: false,
+		onCancellationRequested: this.emitter.event,
+	};
+
+	cancel(): void {
+		if (this.token.isCancellationRequested) {
+			return;
+		}
+		this.token.isCancellationRequested = true;
+		this.emitter.fire();
+	}
+
+	dispose(): void {
+		this.emitter.dispose();
+	}
+}
+
 const onDidChangeConfiguration = new EventEmitter<unknown>();
 const onDidChangeWorkspaceFolders = new EventEmitter<unknown>();
 const onDidChangeActiveColorTheme = new EventEmitter<unknown>();
@@ -122,9 +207,10 @@ export const window = {
 		window.activeColorTheme = { kind };
 		onDidChangeActiveColorTheme.fire({ kind });
 	},
-	showInformationMessage: vi.fn(),
-	showWarningMessage: vi.fn(),
-	showErrorMessage: vi.fn(),
+	// The real API always returns a Thenable, so callers may chain .then().
+	showInformationMessage: vi.fn(() => Promise.resolve(undefined)),
+	showWarningMessage: vi.fn(() => Promise.resolve(undefined)),
+	showErrorMessage: vi.fn(() => Promise.resolve(undefined)),
 	showQuickPick: vi.fn(),
 	showInputBox: vi.fn(),
 	showSaveDialog: vi.fn(),
@@ -138,7 +224,11 @@ export const window = {
 		dispose: vi.fn(),
 		clear: vi.fn(),
 	})),
+	createInputBox: vi.fn(),
+	createQuickPick: vi.fn(),
 	createStatusBarItem: vi.fn(),
+	createTerminal: vi.fn(),
+	createWebviewPanel: vi.fn(),
 	registerUriHandler: vi.fn(() => ({ dispose: vi.fn() })),
 };
 
@@ -150,12 +240,15 @@ export const commands = {
 export const workspace = {
 	getConfiguration: vi.fn(), // your helpers override this
 	workspaceFolders: [] as unknown[],
+	workspaceFile: undefined as Uri | undefined,
 	fs: {
 		readFile: vi.fn(),
 		writeFile: vi.fn(),
 		stat: vi.fn(),
 		readDirectory: vi.fn(),
 	},
+	openTextDocument: vi.fn(),
+	registerTextDocumentContentProvider: vi.fn(() => ({ dispose: vi.fn() })),
 	onDidChangeConfiguration: onDidChangeConfiguration.event,
 	onDidChangeWorkspaceFolders: onDidChangeWorkspaceFolders.event,
 
@@ -166,6 +259,8 @@ export const workspace = {
 		onDidChangeWorkspaceFolders.fire(e),
 };
 
+let uriScheme = "vscode";
+
 export const env = {
 	appName: "Visual Studio Code",
 	appRoot: "/app",
@@ -174,14 +269,25 @@ export const env = {
 	sessionId: "test-session-id",
 	remoteName: undefined as string | undefined,
 	shell: "/bin/bash",
-	uriScheme: "vscode",
+	get uriScheme(): string {
+		return uriScheme;
+	},
 	openExternal: vi.fn(),
+
+	// test-only trigger, returning the scheme it replaced:
+	__setUriScheme: (scheme: string): string => {
+		const previous = uriScheme;
+		uriScheme = scheme;
+		return previous;
+	},
 };
 
 export const extensions = {
 	getExtension: vi.fn(),
 	all: [] as unknown[],
 };
+
+export const version = "1.106.0-test";
 
 const vscode = {
 	ProgressLocation,
@@ -195,13 +301,16 @@ const vscode = {
 	InputBoxValidationSeverity,
 	Uri,
 	EventEmitter,
+	CancellationTokenSource,
 	MarkdownString,
 	ThemeColor,
+	TreeItem,
 	window,
 	commands,
 	workspace,
 	env,
 	extensions,
+	version,
 };
 
 export default vscode;

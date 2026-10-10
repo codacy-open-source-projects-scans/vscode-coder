@@ -1,0 +1,57 @@
+.ui-spinner {
+	display: inline-block;
+	box-sizing: border-box;
+	width: 28px;
+	height: 28px;
+	border: 2px solid transparent;
+	border-block-start-color: var(--ui-progress-foreground);
+	border-inline-end-color: var(--ui-progress-foreground);
+	border-radius: 50%;
+	animation: ui-spinner-rotate 1s linear infinite;
+}
+
+.ui-spinner--small {
+	width: 16px;
+	height: 16px;
+}
+
+.ui-spinner--large {
+	width: 40px;
+	height: 40px;
+	border-width: 3px;
+}
+
+@keyframes ui-spinner-rotate {
+	to {
+		transform: rotate(1turn);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	/* Tint the uncolored sides so the stopped ring reads as a paused spinner */
+	.ui-spinner {
+		--ui-spinner-track: color-mix(
+			in srgb,
+			var(--ui-progress-foreground) 25%,
+			transparent
+		);
+
+		animation: none;
+		border-block-end-color: var(--ui-spinner-track);
+		border-inline-start-color: var(--ui-spinner-track);
+	}
+}
+
+@media (forced-colors: active) {
+	.ui-spinner {
+		/* Overrides the reduced-motion tint too */
+		border-color: Canvas;
+		border-block-start-color: Highlight;
+		border-inline-end-color: Highlight;
+	}
+}
+
+/* data-pixel is set in .storybook/preview.ts via isPixel(). */
+:root[data-pixel] .ui-spinner {
+	animation: none;
+}

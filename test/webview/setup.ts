@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { vi } from "vitest";
+import { afterAll, vi } from "vitest";
 
 // Lit's dev build emits warnings we can't avoid (resolve.conditions is
 // additive so we can't force the production bundle). Filter them out.
@@ -25,15 +25,42 @@ globalThis.ResizeObserver = class {
 	disconnect() {}
 };
 
+// jsdom has no Canvas 2D; return a Proxy that accepts any prop read or method
+// call. measureText and createLinearGradient must return real shapes because
+// the caller reads fields off them.
+const noop = () => undefined;
+const stubCtx = new Proxy(
+	{
+		measureText: (s: string) => ({ width: s.length * 6 }),
+		createLinearGradient: () => ({ addColorStop: noop }),
+	},
+	{
+		get(target, prop, receiver) {
+			if (prop in target) return Reflect.get(target, prop, receiver);
+			// Return noop for any method/property the chart calls (ctx.beginPath,
+			// ctx.moveTo, etc). Symbol lookups (Symbol.toPrimitive) stay undefined.
+			return typeof prop === "string" ? noop : undefined;
+		},
+		set: () => true,
+	},
+);
+HTMLCanvasElement.prototype.getContext = ((type: string) =>
+	type === "2d" ? stubCtx : null) as HTMLCanvasElement["getContext"];
+
 // VscodeSingleSelect fires internal slot-change events that read properties
 // jsdom doesn't support (e.g. textContent of slotted elements). Suppress
-// these uncaught errors from the third-party web component.
-process.on("uncaughtException", (err: Error) => {
+// these uncaught errors from the third-party web component. Removed per file
+// because vmForks shares `process` across files.
+function ignoreWebComponentErrors(err: Error): void {
 	const msg = err?.message ?? "";
 	if (msg.includes("reading 'trim'") || msg.includes("reading 'unobserve'")) {
 		return;
 	}
 	throw err;
+}
+process.on("uncaughtException", ignoreWebComponentErrors);
+afterAll(() => {
+	process.off("uncaughtException", ignoreWebComponentErrors);
 });
 
 // Form controls call setFormValue/setValidity which jsdom doesn't provide.

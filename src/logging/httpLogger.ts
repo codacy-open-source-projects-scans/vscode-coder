@@ -1,7 +1,7 @@
 import { isAxiosError, type AxiosResponse } from "axios";
 import { getErrorMessage } from "coder/site/src/api/errors";
 
-import { getErrorDetail } from "../error/errorUtils";
+import { getErrorDetail } from "../error/normalize";
 
 import {
 	formatBody,
@@ -11,12 +11,12 @@ import {
 	formatTime,
 	formatUri,
 } from "./formatters";
+import { createRequestId, shortId } from "./ids";
 import {
 	HttpClientLogLevel,
 	type RequestConfigWithMeta,
 	type RequestMeta,
 } from "./types";
-import { createRequestId, shortId } from "./utils";
 
 import type { Logger } from "./logger";
 
@@ -45,8 +45,13 @@ export function logRequest(
 	const { requestId, method, url, requestSize } = parseConfig(config);
 
 	const msg = [
-		`→ ${shortId(requestId)} ${method} ${url} ${requestSize}`,
-		...buildExtraLogs(config.headers, config.data, logLevel),
+		`→ [request ${shortId(requestId)}] ${method} ${url} ${requestSize}`,
+		...buildExtraLogs(
+			config.headers,
+			config.data,
+			logLevel,
+			config.headerCommandKeys,
+		),
 	];
 	logger.trace(msg.join("\n"));
 }
@@ -68,8 +73,13 @@ export function logResponse(
 	);
 
 	const msg = [
-		`← ${shortId(requestId)} ${response.status} ${method} ${url} ${responseSize} ${time}`,
-		...buildExtraLogs(response.headers, response.data, logLevel),
+		`← [request ${shortId(requestId)}] ${response.status} ${method} ${url} ${responseSize} ${time}`,
+		...buildExtraLogs(
+			response.headers,
+			response.data,
+			logLevel,
+			response.config.headerCommandKeys,
+		),
 	];
 	logger.trace(msg.join("\n"));
 }
@@ -105,21 +115,23 @@ export function logError(
 				);
 			}
 
-			logPrefix = `← ${shortId(requestId)} ${error.response.status} ${method} ${url} ${time}`;
+			logPrefix = `← [request ${shortId(requestId)}] ${error.response.status} ${method} ${url} ${time}`;
 			extraLines = buildExtraLogs(
 				error.response.headers,
 				error.response.data,
 				logLevel,
+				config?.headerCommandKeys,
 			);
 		} else {
 			if (errorParts.length === 0) {
 				errorParts.push(error.code || "Network error");
 			}
-			logPrefix = `✗ ${shortId(requestId)} ${method} ${url} ${time}`;
+			logPrefix = `✗ [request ${shortId(requestId)}] ${method} ${url} ${time}`;
 			extraLines = buildExtraLogs(
 				error?.config?.headers ?? {},
 				error.config?.data,
 				logLevel,
+				config?.headerCommandKeys,
 			);
 		}
 
@@ -134,10 +146,12 @@ function buildExtraLogs(
 	headers: Record<string, unknown>,
 	body: unknown,
 	logLevel: HttpClientLogLevel,
+	headerCommandKeys: readonly string[] | undefined,
 ) {
 	const msg = [];
 	if (logLevel >= HttpClientLogLevel.HEADERS) {
-		msg.push(formatHeaders(headers));
+		// Headers applied by the header command are treated as sensitive too.
+		msg.push(formatHeaders(headers, headerCommandKeys ?? []));
 	}
 	if (logLevel >= HttpClientLogLevel.BODY) {
 		msg.push(formatBody(body));

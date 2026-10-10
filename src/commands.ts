@@ -5,24 +5,66 @@ import * as semver from "semver";
 import * as vscode from "vscode";
 
 import {
-	createWorkspaceIdentifier,
 	extractAgents,
+	createWorkspaceIdentifier,
 	workspaceStatusLabel,
-} from "./api/api-helper";
-import * as cliExec from "./core/cliExec";
-import { appendVsCodeLogs } from "./core/supportBundleLogs";
+} from "./api/models";
+import * as cliExec from "./cli/cliExec";
+import { runDiagnosticCli } from "./command/diagnosticFlow";
+import { openInBrowser, toSafeHost } from "./common/url";
+import { raceWithAbort } from "./error/abort";
 import { CertificateError } from "./error/certificateError";
-import { toError } from "./error/errorUtils";
-import { type FeatureSet, featureSetForVersion } from "./featureSet";
-import { withCancellableProgress, withProgress } from "./progress";
-import { maybeAskAgent, maybeAskUrl } from "./promptUtils";
+import { toError } from "./error/normalize";
+import { type CliFeatureSet, cliFeatureSet } from "./featureSet";
 import {
-	RECOMMENDED_SSH_SETTINGS,
+	AuthTelemetry,
+	type AuthLoginOutcome,
+	type AuthLogoutOutcome,
+} from "./instrumentation/auth";
+import {
+	DiagnosticTelemetry,
+	type DiagnosticTrace,
+} from "./instrumentation/diagnostics";
+import { WorkspaceOperationTelemetry } from "./instrumentation/workspace";
+import {
+	type DevContainerMode,
+	type WorkspaceOpenSource,
+	WorkspaceOpenTelemetry,
+	type WorkspaceOpenTrace,
+	type WorkspacePickerErrorCategory,
+	type WorkspacePickerResult,
+	type WorkspacePickerSource,
+} from "./instrumentation/workspaceOpen";
+import {
+	LegacyEditorId,
+	currentEditorId,
+	hostEditorId,
+	isRemoteAuthorityCompatible,
+	parseRemoteAuthority,
+	sshHostOf,
+	toLegacyAuthority,
+	toRemoteAuthority,
+} from "./remote/authority";
+import {
 	applySettingOverrides,
+	getRecommendedSshSettings,
 } from "./remote/sshOverrides";
-import { resolveCliAuth } from "./settings/cli";
-import { toRemoteAuthority, toSafeHost } from "./util";
-import { vscodeProposed } from "./vscodeProposed";
+import { isKeyringEnabled, resolveCliAuth } from "./settings/cli";
+import { appendVsCodeLogs } from "./supportBundle/appendVsCodeLogs";
+import {
+	getRemoteServerDataPath,
+	toRemoteLogGlobs,
+} from "./supportBundle/remoteServerDataPath";
+import { runExportTelemetryCommand } from "./telemetry/export/command";
+import {
+	reportElapsedProgress,
+	withCancellableProgress,
+	withProgress,
+} from "./ui/progress";
+import { maybeAskAgent, maybeAskUrl } from "./ui/prompts";
+import { vscodeProposed } from "./vscode/proposed";
+import { parseNetcheckReport } from "./webviews/netcheck/types";
+import { parseSpeedtestResult } from "./webviews/speedtest/types";
 import {
 	AgentTreeItem,
 	type OpenableTreeItem,
@@ -34,19 +76,33 @@ import type {
 	WorkspaceAgent,
 } from "coder/site/src/api/typesGenerated";
 
+import type { DashboardPage } from "@repo/shared";
+
 import type { CoderApi } from "./api/coderApi";
-import type { CliManager } from "./core/cliManager";
-import type { ServiceContainer } from "./core/container";
-import type { MementoManager } from "./core/mementoManager";
-import type { PathResolver } from "./core/pathResolver";
-import type { SecretsManager } from "./core/secretsManager";
+import type { CliManager } from "./cli/cliManager";
+import type { ServiceContainer } from "./container";
 import type { DeploymentManager } from "./deployment/deploymentManager";
 import type { Logger } from "./logging/logger";
-import type { LoginCoordinator } from "./login/loginCoordinator";
+import type { LoginCoordinator, LoginMethod } from "./login/loginCoordinator";
+import type { MementoManager } from "./storage/mementoManager";
+import type { PathResolver } from "./storage/pathResolver";
+import type { SecretsManager, SessionAuth } from "./storage/secretsManager";
+import type { TelemetryService } from "./telemetry/service";
+import type { NetcheckPanelFactory } from "./webviews/netcheck/netcheckPanelFactory";
+import type { SpeedtestPanelFactory } from "./webviews/speedtest/speedtestPanelFactory";
 import type {
 	DuplicateWorkspaceIpc,
 	PongMessage,
 } from "./workspace/duplicateWorkspaceIpc";
+
+/** One entry from the private `_workbench.getRecentlyOpened` command. */
+interface RecentlyOpened {
+	folderUri?: vscode.Uri;
+	workspace?: { configPath?: vscode.Uri };
+}
+
+const NO_SSH_CONFIG_MESSAGE =
+	"No SSH config has been generated yet. It is written when you connect to a workspace.";
 
 interface OpenOptions {
 	workspaceOwner?: string;
@@ -54,10 +110,45 @@ interface OpenOptions {
 	agentName?: string;
 	folderPath?: string;
 	openRecent?: boolean;
+	source?: WorkspaceOpenSource;
 	/** When false, an absent folderPath opens a bare remote window instead of
 	 *  falling back to the agent's expanded_directory. Defaults to true. */
 	useDefaultDirectory?: boolean;
 }
+
+interface LoginArgs {
+	readonly url?: string;
+	readonly autoLogin?: boolean;
+}
+
+type WorkspaceResolution =
+	| {
+			readonly status: "selected";
+			readonly agentName?: string;
+			readonly client: CoderApi;
+			readonly workspaceId: string;
+			/** Authority for the workspace, live or reconstructed from metadata. */
+			readonly remoteAuthority?: string;
+	  }
+	| { readonly status: "cancelled" }
+	| {
+			readonly status: "failed";
+			readonly category: WorkspacePickerErrorCategory;
+	  };
+
+type OpenWorkspaceResult =
+	| { readonly status: "opened"; readonly handoff: "folder" | "empty_window" }
+	| { readonly status: "cancelled"; readonly stage: "recent_folder_picker" };
+
+class SupportBundleUnsupportedCliError extends Error {
+	public constructor() {
+		super(
+			"Support bundles require Coder CLI v2.10.0 or later. Please update your Coder deployment.",
+		);
+	}
+}
+
+const UPDATE_AND_RESTART_ACTION = "Update and Restart";
 
 const openDefaults = {
 	openRecent: false,
@@ -72,6 +163,12 @@ export class Commands {
 	private readonly cliManager: CliManager;
 	private readonly loginCoordinator: LoginCoordinator;
 	private readonly duplicateWorkspaceIpc: DuplicateWorkspaceIpc;
+	private readonly speedtestPanelFactory: SpeedtestPanelFactory;
+	private readonly netcheckPanelFactory: NetcheckPanelFactory;
+	private readonly telemetryService: TelemetryService;
+	private readonly authTelemetry: AuthTelemetry;
+	private readonly diagnosticTelemetry: DiagnosticTelemetry;
+	private readonly workspaceOpenTelemetry: WorkspaceOpenTelemetry;
 
 	// These will only be populated when actively connected to a workspace and are
 	// used in commands.  Because commands can be executed by the user, it is not
@@ -81,6 +178,7 @@ export class Commands {
 	// are logged into (for convenience; otherwise the recents menu can be a pain
 	// if you use multiple deployments).
 	public workspace?: Workspace;
+	public agent?: WorkspaceAgent;
 	public workspaceLogPath?: string;
 	public remoteWorkspaceClient?: CoderApi;
 
@@ -89,6 +187,12 @@ export class Commands {
 		private readonly extensionClient: CoderApi,
 		private readonly deploymentManager: DeploymentManager,
 	) {
+		this.telemetryService = serviceContainer.getTelemetryService();
+		this.authTelemetry = new AuthTelemetry(this.telemetryService);
+		this.diagnosticTelemetry = new DiagnosticTelemetry(this.telemetryService);
+		this.workspaceOpenTelemetry = new WorkspaceOpenTelemetry(
+			this.telemetryService,
+		);
 		this.logger = serviceContainer.getLogger();
 		this.pathResolver = serviceContainer.getPathResolver();
 		this.mementoManager = serviceContainer.getMementoManager();
@@ -96,6 +200,8 @@ export class Commands {
 		this.cliManager = serviceContainer.getCliManager();
 		this.loginCoordinator = serviceContainer.getLoginCoordinator();
 		this.duplicateWorkspaceIpc = serviceContainer.getDuplicateWorkspaceIpc();
+		this.speedtestPanelFactory = serviceContainer.getSpeedtestPanelFactory();
+		this.netcheckPanelFactory = serviceContainer.getNetcheckPanelFactory();
 	}
 
 	/**
@@ -110,23 +216,34 @@ export class Commands {
 	}
 
 	/**
+	 * Get the remote workspace deployment URL, throwing if not connected.
+	 */
+	private requireRemoteBaseUrl(): string {
+		const url = this.remoteWorkspaceClient?.getAxiosInstance().defaults.baseURL;
+		if (!url) {
+			throw new Error("No remote workspace connection");
+		}
+		return url;
+	}
+
+	/**
 	 * Log into a deployment. If already authenticated, this is a no-op.
 	 * If no URL is provided, shows a menu of recent URLs plus defaults.
 	 */
-	public async login(args?: {
-		url?: string;
-		autoLogin?: boolean;
-	}): Promise<void> {
+	public async login(args?: LoginArgs): Promise<void> {
 		if (this.deploymentManager.isAuthenticated()) {
 			return;
 		}
-		await this.performLogin(args);
+		await this.authTelemetry.traceLogin(
+			args?.autoLogin ? "auto_login" : "command",
+			(trace) => this.performLogin(args, trace.setMethod),
+		);
 	}
 
-	private async performLogin(args?: {
-		url?: string;
-		autoLogin?: boolean;
-	}): Promise<void> {
+	private async performLogin(
+		args: LoginArgs | undefined,
+		setMethod: (method: LoginMethod) => void,
+	): Promise<AuthLoginOutcome> {
 		this.logger.debug("Logging in");
 
 		const currentDeployment = await this.secretsManager.getCurrentDeployment();
@@ -136,7 +253,7 @@ export class Commands {
 			currentDeployment?.url,
 		);
 		if (!url) {
-			return; // The user aborted.
+			return { success: false, reason: "no_url_provided" };
 		}
 
 		const safeHostname = toSafeHost(url);
@@ -149,19 +266,26 @@ export class Commands {
 		});
 
 		if (!result.success) {
-			return;
+			return result;
 		}
 
+		// Record the method eagerly so it is captured even if persistence throws.
+		setMethod(result.method);
 		await this.deploymentManager.setDeployment({
 			url,
 			safeHostname,
 			token: result.token,
 			user: result.user,
 		});
+		this.showWelcomeMessage(result.user.username);
+		this.logger.debug("Login complete to deployment:", url);
+		return { success: true, method: result.method };
+	}
 
+	private showWelcomeMessage(username: string): void {
 		vscode.window
 			.showInformationMessage(
-				`Welcome to Coder, ${result.user.username}!`,
+				`Welcome to Coder, ${username}!`,
 				{
 					detail:
 						"You can now use the Coder extension to manage your Coder instance.",
@@ -173,7 +297,6 @@ export class Commands {
 					vscode.commands.executeCommand("coder.open");
 				}
 			});
-		this.logger.debug("Login complete to deployment:", url);
 	}
 
 	/**
@@ -181,98 +304,209 @@ export class Commands {
 	 * editor document.  Can be triggered from the sidebar or command palette.
 	 */
 	public async speedTest(item?: OpenableTreeItem): Promise<void> {
+		await this.diagnosticTelemetry.trace("speed_test", (telemetry) =>
+			this.runSpeedTest(item, telemetry),
+		);
+	}
+
+	private async runSpeedTest(
+		item: OpenableTreeItem | undefined,
+		telemetry: DiagnosticTrace,
+	): Promise<void> {
 		const resolved = await this.resolveClientAndWorkspace(item);
-		if (!resolved) {
+		if (resolved.status === "cancelled") {
+			telemetry.abort("workspace_picker");
+			return;
+		}
+		if (resolved.status === "failed") {
+			telemetry.error(resolved.category);
 			return;
 		}
 
 		const { client, workspaceId } = resolved;
 
-		const duration = await vscode.window.showInputBox({
+		const input = await vscode.window.showInputBox({
 			title: "Speed Test Duration",
-			prompt: "Duration for the speed test",
-			value: "5s",
+			prompt: "Duration in seconds",
+			value: "5",
 			validateInput: (value) => {
-				const v = value.trim();
-				if (v && !cliExec.isGoDuration(v)) {
-					return "Invalid Go duration (e.g., 5s, 10s, 1m, 1m30s)";
+				const n = Number(value.trim());
+				if (!value.trim() || !Number.isFinite(n) || n <= 0) {
+					return "Please enter a positive number";
 				}
 				return undefined;
 			},
 		});
-		if (duration === undefined) {
+		if (input === undefined) {
+			telemetry.abort("input");
 			return;
 		}
-		const trimmedDuration = duration.trim();
+		const seconds = Number(input.trim());
+		telemetry.setRequestedDuration(seconds);
 
-		const result = await withCancellableProgress(
-			async ({ signal, progress }) => {
-				progress.report({ message: "Resolving CLI..." });
+		await runDiagnosticCli({
+			telemetry,
+			logger: this.logger,
+			name: "Speed test",
+			progressTitle: `Running speed test for ${workspaceId}`,
+			exec: async ({ signal, progress }) => {
+				progress.report({ message: "Connecting..." });
 				const env = await this.resolveCliEnv(client);
-				progress.report({ message: "Running..." });
-				return cliExec.speedtest(env, workspaceId, trimmedDuration, signal);
+
+				const stopProgress = reportElapsedProgress({
+					progress,
+					totalMs: seconds * 1000,
+					format: (pct, elapsedMs) =>
+						pct >= 100
+							? "Collecting results..."
+							: `${Math.floor(elapsedMs / 1000)}s / ${seconds}s`,
+				});
+				try {
+					return await cliExec.speedtest(
+						env,
+						workspaceId,
+						`${seconds}s`,
+						signal,
+					);
+				} finally {
+					stopProgress();
+				}
 			},
-			{
-				location: vscode.ProgressLocation.Notification,
-				title: trimmedDuration
-					? `Speed test for ${workspaceId} (${trimmedDuration})`
-					: `Speed test for ${workspaceId}`,
-				cancellable: true,
+			parseAndDisplay: (rawJson) => {
+				const parsed = parseSpeedtestResult(rawJson);
+				this.speedtestPanelFactory.show({
+					result: parsed,
+					rawJson,
+					workspaceId,
+				});
+				// Record success after the panel shows, so a display failure is an
+				// error rather than a contradictory success span.
+				telemetry.succeedSpeedtest(parsed);
 			},
-		);
+		});
+	}
 
-		if (result.ok) {
-			const doc = await vscode.workspace.openTextDocument({
-				content: result.value,
-				language: "json",
-			});
-			await vscode.window.showTextDocument(doc);
-			return;
-		}
-
-		if (result.cancelled) {
-			return;
-		}
-
-		this.logger.error("Speed test failed", result.error);
-		vscode.window.showErrorMessage(
-			`Speed test failed: ${toError(result.error).message}`,
+	/**
+	 * Run a network check against the current deployment and display the
+	 * report in a webview panel.  Can be triggered from the sidebar or command
+	 * palette.
+	 */
+	public async netcheck(): Promise<void> {
+		await this.diagnosticTelemetry.trace("netcheck", (telemetry) =>
+			this.runNetcheck(telemetry),
 		);
 	}
 
+	private async runNetcheck(telemetry: DiagnosticTrace): Promise<void> {
+		// Netcheck reports on the deployment as a whole, so unlike the other
+		// diagnostics there is no workspace to resolve; prefer the deployment
+		// the current remote workspace belongs to.
+		const client = this.remoteWorkspaceClient ?? this.extensionClient;
+		const baseUrl = client.getAxiosInstance().defaults.baseURL;
+		if (!baseUrl) {
+			telemetry.error();
+			vscode.window.showErrorMessage("You are not logged in");
+			return;
+		}
+		const host = toSafeHost(baseUrl);
+
+		await runDiagnosticCli({
+			telemetry,
+			logger: this.logger,
+			name: "Network check",
+			progressTitle: `Running network check for ${host}`,
+			exec: async ({ signal, progress }) => {
+				progress.report({ message: "Resolving CLI..." });
+				const env = await this.resolveCliEnv(client);
+				progress.report({
+					message: "Gathering network report. This may take a few seconds...",
+				});
+				return await cliExec.netcheck(env, signal);
+			},
+			parseAndDisplay: (rawJson) => {
+				const report = parseNetcheckReport(rawJson);
+				this.netcheckPanelFactory.show({ host, report }, rawJson);
+				// Record success after the panel shows, so a display failure is an
+				// error rather than a contradictory success span.
+				telemetry.succeedNetcheck(report);
+			},
+		});
+	}
+
 	public async supportBundle(item?: OpenableTreeItem): Promise<void> {
+		await this.diagnosticTelemetry.trace("support_bundle", (telemetry) =>
+			this.runSupportBundle(item, telemetry),
+		);
+	}
+
+	private async runSupportBundle(
+		item: OpenableTreeItem | undefined,
+		telemetry: DiagnosticTrace,
+	): Promise<void> {
 		const resolved = await this.resolveClientAndWorkspace(item);
-		if (!resolved) {
+		if (resolved.status === "cancelled") {
+			telemetry.abort("workspace_picker");
+			return;
+		}
+		if (resolved.status === "failed") {
+			telemetry.error(resolved.category);
 			return;
 		}
 
-		const { client, workspaceId } = resolved;
+		const { agentName, client, workspaceId, remoteAuthority } = resolved;
+
+		if (!(await this.confirmSupportBundleCollection())) {
+			telemetry.abort("prompt");
+			return;
+		}
 
 		const outputUri = await this.promptSupportBundlePath();
 		if (!outputUri) {
+			telemetry.abort("save_dialog");
 			return;
 		}
 
 		const result = await withCancellableProgress(
 			async ({ signal, progress }) => {
 				progress.report({ message: "Resolving CLI..." });
+				// Independent of the CLI and never rejects, so resolve the globs
+				// concurrently and discard them when the CLI lacks support.
+				const remoteLogGlobs = getRemoteServerDataPath({
+					appRoot: vscode.env.appRoot,
+					remoteAuthority,
+					logger: this.logger,
+				}).then(toRemoteLogGlobs);
 				const env = await this.resolveCliEnv(client);
 				if (!env.featureSet.supportBundle) {
-					throw new Error(
-						"Support bundles require Coder CLI v2.10.0 or later. Please update your Coder deployment.",
-					);
+					throw new SupportBundleUnsupportedCliError();
 				}
 
+				// The resolution APIs take no signal, so race to keep cancel honest.
+				const workspaceFiles = env.featureSet.supportBundleWorkspaceFiles
+					? await raceWithAbort(remoteLogGlobs, signal)
+					: [];
+
 				progress.report({ message: "Collecting diagnostics..." });
-				await cliExec.supportBundle(env, workspaceId, outputUri.fsPath, signal);
+				// Flush buffered below-level connection logs before the CLI runs so
+				// the channel has time to write them to disk; retain the ring so a
+				// later failure flush still replays them. Best-effort: the channel
+				// writes on its own schedule, so the tail may not land in this bundle.
+				this.logger.flush("support_bundle", { retain: true });
+				await cliExec.supportBundle(env, workspaceId, {
+					outputPath: outputUri.fsPath,
+					agentName,
+					workspaceFiles,
+					signal,
+				});
 
 				progress.report({ message: "Adding VS Code logs..." });
 				await appendVsCodeLogs(
 					outputUri.fsPath,
 					{
-						remoteSshLogPath: this.workspaceLogPath,
+						activeProxyLogPath: this.workspaceLogPath,
 						proxyLogDir: this.pathResolver.getProxyLogPath(),
 						extensionLogDir: this.pathResolver.getCodeLogDir(),
+						telemetryDir: this.pathResolver.getTelemetryPath(),
 					},
 					this.logger,
 				);
@@ -286,27 +520,31 @@ export class Commands {
 			},
 		);
 
-		if (result.ok) {
-			const action = await vscode.window.showInformationMessage(
-				`Support bundle saved to ${result.value.fsPath}`,
-				"Reveal in File Explorer",
-			);
-			if (action === "Reveal in File Explorer") {
-				await vscode.commands.executeCommand("revealFileInOS", result.value);
+		if (!result.ok) {
+			if (result.cancelled) {
+				telemetry.abort("progress");
+				return;
 			}
+			telemetry.error(
+				result.error instanceof SupportBundleUnsupportedCliError
+					? "unsupported_cli"
+					: undefined,
+			);
+			this.logger.error("Support bundle failed", result.error);
+			vscode.window.showErrorMessage(
+				`Support bundle failed: ${toError(result.error).message}`,
+			);
 			return;
 		}
 
-		if (result.cancelled) {
-			return;
-		}
-
-		this.logger.error("Support bundle failed", result.error);
-		vscode.window.showErrorMessage(
-			`Support bundle failed: ${toError(result.error).message}`,
+		const action = await vscode.window.showInformationMessage(
+			`Support bundle saved to ${result.value.fsPath}`,
+			"Reveal in File Explorer",
 		);
+		if (action === "Reveal in File Explorer") {
+			await vscode.commands.executeCommand("revealFileInOS", result.value);
+		}
 	}
-
 	private promptSupportBundlePath(): Thenable<vscode.Uri | undefined> {
 		const defaultName = `coder-support-${Math.floor(Date.now() / 1000)}.zip`;
 		return vscode.window.showSaveDialog({
@@ -314,6 +552,109 @@ export class Commands {
 			filters: { "Zip files": ["zip"] },
 			title: "Save Support Bundle",
 		});
+	}
+
+	/** Modal disclosure of what a support bundle collects; the CLI's own prompt is suppressed. */
+	private async confirmSupportBundleCollection(): Promise<boolean> {
+		const detail = [
+			"A support bundle may contain sensitive information. It collects:",
+			"",
+			"\u2022 Deployment and workspace diagnostics",
+			"\u2022 Coder extension and connection logs from recent VS Code windows",
+			"\u2022 Remote SSH extension logs",
+			"\u2022 Locally recorded telemetry",
+			"\u2022 Coder extension settings",
+			"",
+			"Review the bundle before sharing it.",
+		].join("\n");
+		const choice = await vscode.window.showInformationMessage(
+			"Create a support bundle?",
+			{ modal: true, detail },
+			"Continue",
+		);
+		return choice === "Continue";
+	}
+
+	public async exportTelemetry(): Promise<void> {
+		await this.diagnosticTelemetry.trace("export_telemetry", (telemetry) =>
+			this.runExportTelemetry(telemetry),
+		);
+	}
+
+	private async runExportTelemetry(telemetry: DiagnosticTrace): Promise<void> {
+		await runExportTelemetryCommand(
+			this.pathResolver.getTelemetryPath(),
+			this.logger,
+			() => this.telemetryService.flush(),
+			this.telemetryService.getContext(),
+			telemetry,
+		);
+	}
+
+	/** Open the generated SSH config, picking a file when several exist. */
+	public async openSshConfig(): Promise<void> {
+		const configPath =
+			this.connectedSshConfigPath() ?? (await this.pickSshConfigPath());
+		if (!configPath) {
+			return;
+		}
+		try {
+			await openFile(configPath);
+		} catch {
+			vscode.window.showInformationMessage(NO_SSH_CONFIG_MESSAGE);
+			return;
+		}
+		// The file is rewritten on every connection, so edits would be lost.
+		await vscode.commands.executeCommand(
+			"workbench.action.files.setActiveEditorReadonlyInSession",
+		);
+	}
+
+	/** The file serving this window's connection, if it has one. */
+	private connectedSshConfigPath(): string | undefined {
+		try {
+			// remoteAuthority is a proposed API; our own vscode module may not read it.
+			const authority = vscodeProposed.env.remoteAuthority;
+			const parts = authority ? parseRemoteAuthority(authority) : null;
+			return parts
+				? this.pathResolver.getSshConfigPath(
+						parts.safeHostname,
+						hostEditorId(parts.sshHost),
+					)
+				: undefined;
+		} catch {
+			// Malformed Coder authority or unavailable API; fall back to the picker.
+			return undefined;
+		}
+	}
+
+	/** Ask which config to open, of this editor's prefixes and the legacy one. */
+	private async pickSshConfigPath(): Promise<string | undefined> {
+		const files = await readdirOrEmpty(this.pathResolver.getSshConfigDir());
+		const items = [...new Set([currentEditorId(), LegacyEditorId])].flatMap(
+			(editorId) =>
+				files
+					.map((file) => this.pathResolver.parseSshConfigFile(file, editorId))
+					.filter((safeHostname) => safeHostname !== undefined)
+					.map((safeHostname) => ({
+						label: safeHostname,
+						// Which hosts it serves; two files can share a deployment.
+						description: `coder-${editorId}.${safeHostname}--*`,
+						path: this.pathResolver.getSshConfigPath(safeHostname, editorId),
+					})),
+		);
+		if (items.length === 0) {
+			vscode.window.showInformationMessage(NO_SSH_CONFIG_MESSAGE);
+			return undefined;
+		}
+		if (items.length === 1) {
+			return items[0].path;
+		}
+		const picked = await vscode.window.showQuickPick(items, {
+			title: "Open generated SSH configuration",
+			placeHolder: "Select a deployment",
+		});
+		return picked?.path;
 	}
 
 	/**
@@ -359,21 +700,53 @@ export class Commands {
 	 * Log out and clear stored credentials, requiring re-authentication on next login.
 	 */
 	public async logout(): Promise<void> {
-		if (!this.deploymentManager.isAuthenticated()) {
-			return;
+		await this.authTelemetry.traceLogout(() => this.performLogout());
+	}
+
+	private async performLogout(): Promise<AuthLogoutOutcome> {
+		const deployment = this.deploymentManager.getCurrentDeployment();
+		if (!this.deploymentManager.isAuthenticated() || !deployment) {
+			return { success: false, reason: "not_authenticated" };
+		}
+
+		const auth = await this.secretsManager.getSessionAuth(
+			deployment.safeHostname,
+		);
+		const signOutCli = await this.askSignOutCli(auth);
+		if (signOutCli === undefined) {
+			return { success: false, reason: "user_dismissed" };
+		}
+		// Another window may have switched deployments while the prompt was open.
+		if (this.deploymentManager.getCurrentDeployment()?.url !== deployment.url) {
+			return { success: false, reason: "not_authenticated" };
 		}
 
 		this.logger.debug("Logging out");
-
-		const deployment = this.deploymentManager.getCurrentDeployment();
-
-		await this.deploymentManager.clearDeployment();
-
-		if (deployment) {
-			await this.cliManager.clearCredentials(deployment.url);
-			await this.secretsManager.clearAllAuthData(deployment.safeHostname);
+		await this.deploymentManager.clearDeployment("logout");
+		const cleared = await this.cliManager.clearCredentials(deployment.url, {
+			signOutCli,
+		});
+		await this.secretsManager.clearAllAuthData(deployment.safeHostname);
+		if (!cleared) {
+			vscode.window
+				.showWarningMessage(
+					'You\'ve been logged out of Coder, but some credentials could not be removed. Log out again to retry, or run "coder logout" in a terminal.',
+					"Show Output",
+				)
+				.then((action) => {
+					if (action === "Show Output") {
+						this.logger.show();
+					}
+				});
+			return { success: false, reason: "cleanup_incomplete" };
 		}
 
+		this.showLogoutMessage();
+		this.logger.debug("Logout complete");
+		return { success: true };
+	}
+
+	private showLogoutMessage(): void {
 		vscode.window
 			.showInformationMessage("You've been logged out of Coder!", "Login")
 			.then((action) => {
@@ -383,8 +756,36 @@ export class Commands {
 					});
 				}
 			});
+	}
 
-		this.logger.debug("Logout complete");
+	/** Whether to sign the CLI out too. Asks when it holds this session's token; undefined when dismissed. */
+	private async askSignOutCli(
+		auth: SessionAuth | undefined,
+	): Promise<boolean | undefined> {
+		if (
+			!auth?.token ||
+			!(await this.cliManager.holdsToken(auth.url, auth.token))
+		) {
+			return false;
+		}
+		// The CLI cannot refresh an OAuth token and logout revokes it, so there is nothing to keep.
+		if (auth.oauth) {
+			return true;
+		}
+		const action = await vscodeProposed.window.showWarningMessage(
+			"Sign out of the Coder CLI too?",
+			{
+				useCustom: true,
+				modal: true,
+				detail: `${auth.url}\n\nThe Coder CLI is signed in with this session. Signing it out also signs out other tools that rely on it.`,
+			},
+			"Sign Out",
+			"Keep Signed In",
+		);
+		if (action === undefined) {
+			return undefined;
+		}
+		return action === "Sign Out";
 	}
 
 	/**
@@ -393,7 +794,9 @@ export class Commands {
 	 */
 	public async switchDeployment(): Promise<void> {
 		this.logger.debug("Switching deployment");
-		await this.performLogin();
+		await this.authTelemetry.traceLogin("switch_deployment", (trace) =>
+			this.performLogin(undefined, trace.setMethod),
+		);
 	}
 
 	/**
@@ -440,7 +843,11 @@ export class Commands {
 				const selectedHostname = selected.hostnames[0];
 				const auth = await this.secretsManager.getSessionAuth(selectedHostname);
 				if (auth?.url) {
-					await this.cliManager.clearCredentials(auth.url);
+					const signOutCli = await this.askSignOutCli(auth);
+					if (signOutCli === undefined) {
+						return;
+					}
+					await this.cliManager.clearCredentials(auth.url, { signOutCli });
 				}
 				await this.secretsManager.clearAllAuthData(selectedHostname);
 				this.logger.info("Removed credentials for", selectedHostname);
@@ -453,20 +860,24 @@ export class Commands {
 					{
 						useCustom: true,
 						modal: true,
-						detail: `This will remove credentials for: ${selected.hostnames.join(", ")}\n\nYou'll need to log in again to access them.`,
+						detail: `This will remove credentials for: ${selected.hostnames.join(", ")}\n\nYou'll need to log in again to access them.${isKeyringEnabled(vscode.workspace.getConfiguration()) ? " This also signs the Coder CLI out where it shares a session." : ""}`,
 					},
 					"Remove All",
 				);
 				if (confirm === "Remove All") {
-					await Promise.all(
-						selected.hostnames.map(async (h) => {
-							const auth = await this.secretsManager.getSessionAuth(h);
-							if (auth?.url) {
-								await this.cliManager.clearCredentials(auth.url);
-							}
-							await this.secretsManager.clearAllAuthData(h);
-						}),
-					);
+					// One at a time: `coder logout` rewrites the whole keyring entry.
+					for (const h of selected.hostnames) {
+						const auth = await this.secretsManager.getSessionAuth(h);
+						if (auth?.url) {
+							await this.cliManager.clearCredentials(auth.url, {
+								signOutCli: await this.cliManager.holdsToken(
+									auth.url,
+									auth.token,
+								),
+							});
+						}
+						await this.secretsManager.clearAllAuthData(h);
+					}
 					this.logger.info(
 						"Removed credentials for all deployments:",
 						selected.hostnames.join(", "),
@@ -488,7 +899,15 @@ export class Commands {
 	 * Apply recommended SSH settings for reliable Coder workspace connections.
 	 */
 	public async applyRecommendedSettings(): Promise<void> {
-		const entries = Object.entries(RECOMMENDED_SSH_SETTINGS);
+		const entries = Object.entries(
+			getRecommendedSshSettings(vscode.workspace.getConfiguration()),
+		);
+		if (entries.length === 0) {
+			vscode.window.showInformationMessage(
+				"No recommended SSH settings are supported by the installed Remote SSH extension.",
+			);
+			return;
+		}
 		const summary = entries.map(([, s]) => s.label).join("\n");
 		const confirm = await vscodeProposed.window.showWarningMessage(
 			"Apply Recommended SSH Settings",
@@ -539,9 +958,7 @@ export class Commands {
 	 * Must only be called if currently logged in.
 	 */
 	public async createWorkspace(): Promise<void> {
-		const baseUrl = this.requireExtensionBaseUrl();
-		const uri = baseUrl + "/templates";
-		await vscode.commands.executeCommand("vscode.open", uri);
+		await openInBrowser(this.requireExtensionBaseUrl(), "/templates");
 	}
 
 	/**
@@ -554,15 +971,12 @@ export class Commands {
 	 */
 	public async navigateToWorkspace(item?: OpenableTreeItem) {
 		if (item) {
-			const baseUrl = this.requireExtensionBaseUrl();
-			const workspaceId = createWorkspaceIdentifier(item.workspace);
-			const uri = baseUrl + `/@${workspaceId}`;
-			await vscode.commands.executeCommand("vscode.open", uri);
+			await this.openWorkspaceInDashboard(item.workspace, "workspace");
 		} else if (this.workspace && this.remoteWorkspaceClient) {
-			const baseUrl =
-				this.remoteWorkspaceClient.getAxiosInstance().defaults.baseURL;
-			const uri = `${baseUrl}/@${createWorkspaceIdentifier(this.workspace)}`;
-			await vscode.commands.executeCommand("vscode.open", uri);
+			await openInBrowser(
+				this.requireRemoteBaseUrl(),
+				`/@${createWorkspaceIdentifier(this.workspace)}`,
+			);
 		} else {
 			vscode.window.showInformationMessage("No workspace found.");
 		}
@@ -578,18 +992,30 @@ export class Commands {
 	 */
 	public async navigateToWorkspaceSettings(item?: OpenableTreeItem) {
 		if (item) {
-			const baseUrl = this.requireExtensionBaseUrl();
-			const workspaceId = createWorkspaceIdentifier(item.workspace);
-			const uri = baseUrl + `/@${workspaceId}/settings`;
-			await vscode.commands.executeCommand("vscode.open", uri);
+			await this.openWorkspaceInDashboard(item.workspace, "settings");
 		} else if (this.workspace && this.remoteWorkspaceClient) {
-			const baseUrl =
-				this.remoteWorkspaceClient.getAxiosInstance().defaults.baseURL;
-			const uri = `${baseUrl}/@${createWorkspaceIdentifier(this.workspace)}/settings`;
-			await vscode.commands.executeCommand("vscode.open", uri);
+			await openInBrowser(
+				this.requireRemoteBaseUrl(),
+				`/@${createWorkspaceIdentifier(this.workspace)}/settings`,
+			);
 		} else {
 			vscode.window.showInformationMessage("No workspace found.");
 		}
+	}
+
+	/**
+	 * Open a page of a workspace in the Coder dashboard. The workspace must
+	 * belong to the currently logged-in deployment.
+	 */
+	public async openWorkspaceInDashboard(
+		workspace: Workspace,
+		page: DashboardPage,
+	): Promise<void> {
+		const workspaceId = createWorkspaceIdentifier(workspace);
+		await openInBrowser(
+			this.requireExtensionBaseUrl(),
+			`/@${workspaceId}${page === "settings" ? "/settings" : ""}`,
+		);
 	}
 
 	/**
@@ -601,33 +1027,74 @@ export class Commands {
 	 * Throw if not logged into a deployment.
 	 */
 	public async openFromSidebar(item: OpenableTreeItem): Promise<void> {
-		if (item) {
-			const baseUrl = this.extensionClient.getAxiosInstance().defaults.baseURL;
-			if (!baseUrl) {
-				throw new Error("You are not logged in");
-			}
-			if (item instanceof AgentTreeItem) {
-				await this.openWorkspace(baseUrl, item.workspace, item.agent, {
-					openRecent: true,
-				});
-			} else if (item instanceof WorkspaceTreeItem) {
-				const agents = await this.extractAgentsWithFallback(item.workspace);
-				const agent = await maybeAskAgent(agents);
-				if (!agent) {
-					// User declined to pick an agent.
-					return;
-				}
-				await this.openWorkspace(baseUrl, item.workspace, agent, {
-					openRecent: true,
-				});
-			} else {
-				throw new TypeError("Unable to open unknown sidebar item");
-			}
+		if (item instanceof AgentTreeItem) {
+			await this.openWorkspaceFromSidebar(item.workspace, item.agent);
+		} else if (item instanceof WorkspaceTreeItem) {
+			await this.openWorkspaceFromSidebar(item.workspace);
+		} else if (item) {
+			throw new TypeError("Unable to open unknown sidebar item");
 		} else {
 			// If there is no tree item, then the user manually ran this command.
 			// Default to the regular open instead.
-			await this.open();
+			await this.open({ source: "sidebar_fallback" });
 		}
+	}
+
+	/**
+	 * Open a workspace, or one of its agents, that the sidebar lists.
+	 *
+	 * Throws if not logged into a deployment.
+	 */
+	public async openWorkspaceFromSidebar(
+		workspace: Workspace,
+		agent?: WorkspaceAgent,
+	): Promise<void> {
+		const baseUrl = this.requireExtensionBaseUrl();
+		if (agent) {
+			await this.workspaceOpenTelemetry.traceOpen(
+				"sidebar_agent",
+				{ workspace, agent },
+				(telemetry) =>
+					this.runOpenAgentItem(baseUrl, workspace, agent, telemetry),
+			);
+		} else {
+			await this.workspaceOpenTelemetry.traceOpen(
+				"sidebar_workspace",
+				{ workspace },
+				(telemetry) => this.runOpenWorkspaceItem(baseUrl, workspace, telemetry),
+			);
+		}
+	}
+
+	private async runOpenAgentItem(
+		baseUrl: string,
+		workspace: Workspace,
+		agent: WorkspaceAgent,
+		telemetry: WorkspaceOpenTrace,
+	): Promise<boolean> {
+		const result = await this.openWorkspace(baseUrl, workspace, agent, {
+			openRecent: true,
+		});
+		return recordOpenResult(telemetry, { workspace, agent }, result);
+	}
+
+	private async runOpenWorkspaceItem(
+		baseUrl: string,
+		workspace: Workspace,
+		telemetry: WorkspaceOpenTrace,
+	): Promise<boolean> {
+		const agents = await this.extractAgentsWithFallback(workspace);
+		const agent = await maybeAskAgent(agents);
+		if (!agent) {
+			telemetry.abort("agent_picker", { workspace });
+			return false;
+		}
+		const selection = { workspace, agent };
+		telemetry.select(selection);
+		const result = await this.openWorkspace(baseUrl, workspace, agent, {
+			openRecent: true,
+		});
+		return recordOpenResult(telemetry, selection, result);
 	}
 
 	public async openAppStatus(app: {
@@ -667,6 +1134,18 @@ export class Commands {
 	 * cannot be found.
 	 */
 	public async open(options: OpenOptions = {}): Promise<boolean> {
+		const { source = "command", ...rest } = { ...openDefaults, ...options };
+		return this.workspaceOpenTelemetry.traceOpen(
+			source,
+			undefined,
+			(telemetry) => this.runOpen(rest, telemetry),
+		);
+	}
+
+	private async runOpen(
+		options: Omit<OpenOptions, "source">,
+		telemetry: WorkspaceOpenTrace,
+	): Promise<boolean> {
 		const {
 			workspaceOwner,
 			workspaceName,
@@ -674,39 +1153,43 @@ export class Commands {
 			folderPath,
 			openRecent,
 			useDefaultDirectory,
-		} = { ...openDefaults, ...options };
+		} = options;
+		const baseUrl = this.requireExtensionBaseUrl();
 
-		const baseUrl = this.extensionClient.getAxiosInstance().defaults.baseURL;
-		if (!baseUrl) {
-			throw new Error("You are not logged in");
-		}
-
-		let workspace: Workspace | undefined;
+		let workspace: Workspace;
 		if (workspaceOwner && workspaceName) {
 			workspace = await this.extensionClient.getWorkspaceByOwnerAndName(
 				workspaceOwner,
 				workspaceName,
 			);
 		} else {
-			workspace = await this.pickWorkspace();
-			if (!workspace) {
-				// User declined to pick a workspace.
+			const pick = await this.pickWorkspace("workspace_open");
+			if (pick.status === "cancelled") {
+				telemetry.abort("workspace_picker");
 				return false;
 			}
+			if (pick.status === "failed") {
+				telemetry.error(pick.category);
+				return false;
+			}
+			workspace = pick.workspace;
 		}
 
 		const agents = await this.extractAgentsWithFallback(workspace);
 		const agent = await maybeAskAgent(agents, agentName);
 		if (!agent) {
-			// User declined to pick an agent.
+			telemetry.abort("agent_picker", { workspace });
 			return false;
 		}
+		const selection = { workspace, agent };
+		telemetry.select(selection);
 
-		return this.openWorkspace(baseUrl, workspace, agent, {
+		const result = await this.openWorkspace(baseUrl, workspace, agent, {
 			folderPath,
 			openRecent,
 			useDefaultDirectory,
 		});
+		return recordOpenResult(telemetry, selection, result);
 	}
 
 	/**
@@ -723,10 +1206,69 @@ export class Commands {
 		localWorkspaceFolder = "",
 		localConfigFile = "",
 	): Promise<void> {
-		const baseUrl = this.extensionClient.getAxiosInstance().defaults.baseURL;
-		if (!baseUrl) {
-			throw new Error("You are not logged in");
+		const mode: DevContainerMode = localWorkspaceFolder
+			? "dev_container"
+			: "attached_container";
+		await this.workspaceOpenTelemetry.traceDevContainer(mode, () =>
+			this.runOpenDevContainer(
+				workspaceOwner,
+				workspaceName,
+				workspaceAgent,
+				devContainerName,
+				devContainerFolder,
+				localWorkspaceFolder,
+				localConfigFile,
+			),
+		);
+	}
+
+	/** Recently opened folders, and every entry including workspace files. */
+	private async recentlyOpened(): Promise<{
+		folders: vscode.Uri[];
+		entries: vscode.Uri[];
+	}> {
+		let recents: RecentlyOpened[] = [];
+		try {
+			// Private command; without it there is just no history to reuse.
+			const output: { workspaces?: RecentlyOpened[] } =
+				await vscode.commands.executeCommand("_workbench.getRecentlyOpened");
+			recents = output?.workspaces ?? [];
+		} catch (error) {
+			this.logger.warn("Failed to read recently opened folders", error);
 		}
+		return {
+			folders: recents.flatMap((recent) => recent.folderUri ?? []),
+			entries: recents.flatMap(
+				(recent) => recent.folderUri ?? recent.workspace?.configPath ?? [],
+			),
+		};
+	}
+
+	/**
+	 * The host this workspace was last opened on, or this editor's own. Only the
+	 * host carries over, never a recent entry's authority itself: that can name
+	 * another devcontainer of the same workspace.
+	 */
+	private reusableAuthority(recents: vscode.Uri[], target: string): string {
+		const legacyAuthority = toLegacyAuthority(target);
+		const legacyHost = sshHostOf(legacyAuthority);
+		const currentHost = sshHostOf(target);
+		const lastUsed = recents
+			.map((uri) => sshHostOf(uri.authority))
+			.find((host) => host === currentHost || host === legacyHost);
+		return lastUsed === legacyHost ? legacyAuthority : target;
+	}
+
+	private async runOpenDevContainer(
+		workspaceOwner: string,
+		workspaceName: string,
+		workspaceAgent: string,
+		devContainerName: string,
+		devContainerFolder: string,
+		localWorkspaceFolder: string,
+		localConfigFile: string,
+	): Promise<void> {
+		const baseUrl = this.requireExtensionBaseUrl();
 
 		const remoteAuthority = toRemoteAuthority(
 			baseUrl,
@@ -754,12 +1296,17 @@ export class Commands {
 		).toString("hex");
 
 		const type = localWorkspaceFolder ? "dev-container" : "attached-container";
-		const devContainerAuthority = `${type}+${devContainer}@${remoteAuthority}`;
+		const target = `${type}+${devContainer}@${remoteAuthority}`;
 
 		let newWindow = true;
 		if (!vscode.workspace.workspaceFolders?.length) {
 			newWindow = false;
 		}
+
+		const { entries } = await this.recentlyOpened();
+		const authority = this.reusableAuthority(entries, target);
+
+		this.logger.info("Opening devcontainer", { remoteAuthority: authority });
 
 		// Only set the memento when opening a new folder
 		await this.mementoManager.setStartupMode("start");
@@ -767,7 +1314,7 @@ export class Commands {
 			"vscode.openFolder",
 			vscode.Uri.from({
 				scheme: "vscode-remote",
-				authority: devContainerAuthority,
+				authority,
 				path: devContainerFolder,
 			}),
 			newWindow,
@@ -791,16 +1338,23 @@ export class Commands {
 			showUpToDate();
 			return;
 		}
-		const action = await vscodeProposed.window.showWarningMessage(
-			"Update Workspace",
-			{
-				useCustom: true,
-				modal: true,
-				detail: `Update ${createWorkspaceIdentifier(this.workspace)} to the latest version?\n\nUpdating will restart your workspace which stops any running processes and may result in the loss of unsaved work.`,
-			},
-			"Update and Restart",
+		const workspaceName = createWorkspaceIdentifier(this.workspace);
+		const operationTelemetry = new WorkspaceOperationTelemetry(
+			this.telemetryService,
+			workspaceName,
 		);
-		if (action !== "Update and Restart") {
+		const action = await operationTelemetry.traceConfirmationPrompt(async () =>
+			vscodeProposed.window.showWarningMessage(
+				"Update Workspace",
+				{
+					useCustom: true,
+					modal: true,
+					detail: `Update ${workspaceName} to the latest version?\n\nUpdating will restart your workspace which stops any running processes and may result in the loss of unsaved work.`,
+				},
+				UPDATE_AND_RESTART_ACTION,
+			),
+		);
+		if (action !== UPDATE_AND_RESTART_ACTION) {
 			return;
 		}
 
@@ -813,16 +1367,14 @@ export class Commands {
 			return;
 		}
 
-		this.logger.info(
-			`Updating workspace ${createWorkspaceIdentifier(this.workspace)}`,
-		);
+		this.logger.info(`Updating workspace ${workspaceName}`);
 		await this.mementoManager.setStartupMode("update");
 		await vscode.commands.executeCommand("workbench.action.reloadWindow");
 	}
 
 	public async pingWorkspace(item?: OpenableTreeItem): Promise<void> {
 		const resolved = await this.resolveClientAndWorkspace(item);
-		if (!resolved) {
+		if (resolved.status !== "selected") {
 			return;
 		}
 
@@ -844,77 +1396,127 @@ export class Commands {
 	/**
 	 * Resolve the API client and workspace identifier from a sidebar item,
 	 * the currently connected workspace, or by prompting the user to pick one.
-	 * Returns undefined if the user cancels the picker.
+	 * Returns cancelled/failed if the user cancels the picker or the picker cannot load.
 	 */
 	private async resolveClientAndWorkspace(
 		item?: OpenableTreeItem,
-	): Promise<{ client: CoderApi; workspaceId: string } | undefined> {
+	): Promise<WorkspaceResolution> {
 		if (item) {
+			const agentName =
+				item instanceof AgentTreeItem ? item.agent.name : undefined;
 			return {
+				status: "selected",
+				agentName,
 				client: this.extensionClient,
 				workspaceId: createWorkspaceIdentifier(item.workspace),
+				remoteAuthority: await this.toWorkspaceAuthority(
+					this.extensionClient,
+					item.workspace,
+					agentName,
+				),
 			};
 		}
 		if (this.workspace && this.remoteWorkspaceClient) {
 			return {
+				status: "selected",
+				agentName: this.agent?.name,
 				client: this.remoteWorkspaceClient,
 				workspaceId: createWorkspaceIdentifier(this.workspace),
+				remoteAuthority: vscodeProposed.env.remoteAuthority,
 			};
 		}
-		const workspace = await this.pickWorkspace({
+		const pick = await this.pickWorkspace("diagnostic", {
 			title: "Select a running workspace",
 			initialValue: "owner:me status:running ",
 			placeholder: "Search running workspaces...",
 			filter: (w) => w.latest_build.status === "running",
 		});
-		if (!workspace) {
+		if (pick.status === "selected") {
+			return {
+				status: "selected",
+				client: this.extensionClient,
+				workspaceId: createWorkspaceIdentifier(pick.workspace),
+				remoteAuthority: await this.toWorkspaceAuthority(
+					this.extensionClient,
+					pick.workspace,
+				),
+			};
+		}
+		return pick;
+	}
+
+	/**
+	 * Reconstruct the authority Remote-SSH would use, defaulting to the
+	 * first agent like the CLI does.
+	 */
+	private async toWorkspaceAuthority(
+		client: CoderApi,
+		workspace: Workspace,
+		agentName?: string,
+	): Promise<string | undefined> {
+		const baseUrl = client.getAxiosInstance().defaults.baseURL;
+		if (!baseUrl) {
 			return undefined;
 		}
-		return {
-			client: this.extensionClient,
-			workspaceId: createWorkspaceIdentifier(workspace),
-		};
+		const { entries } = await this.recentlyOpened();
+		return this.reusableAuthority(
+			entries,
+			toRemoteAuthority(
+				baseUrl,
+				workspace.owner_name,
+				workspace.name,
+				agentName ?? extractAgents(workspace.latest_build.resources)[0]?.name,
+			),
+		);
 	}
 
 	/** Resolve a CliEnv, preferring a locally cached binary over a network fetch. */
 	private async resolveCliEnv(
 		client: CoderApi,
-	): Promise<cliExec.CliEnv & { featureSet: FeatureSet }> {
+	): Promise<cliExec.CliEnv & { featureSet: CliFeatureSet }> {
 		const baseUrl = client.getAxiosInstance().defaults.baseURL;
 		if (!baseUrl) {
 			throw new Error("You are not logged in");
 		}
 		const safeHost = toSafeHost(baseUrl);
-		let binary: string;
-		try {
-			binary = await this.cliManager.locateBinary(baseUrl);
-		} catch {
-			binary = await this.cliManager.fetchBinary(client);
-		}
+		const binary =
+			(await this.cliManager.locateBinary(baseUrl)) ??
+			(await this.cliManager.fetchBinary(client));
 		const version = semver.parse(await cliExec.version(binary));
-		const featureSet = featureSetForVersion(version);
+		const featureSet = cliFeatureSet(version);
 		const configDir = this.pathResolver.getGlobalConfigDir(safeHost);
 		const configs = vscode.workspace.getConfiguration();
 		const auth = resolveCliAuth(configs, featureSet, baseUrl, configDir);
+		// Same threat model as the connection-time write in remote.ts: token
+		// goes to the file (or keyring on supported systems), never env, since
+		// child env is sibling-readable on most platforms.
+		await this.cliManager.configure(baseUrl, client.getSessionToken() ?? "", {
+			silent: true,
+		});
 		return { binary, configs, auth, featureSet };
 	}
 
 	/**
 	 * Ask the user to select a workspace.  Return undefined if canceled.
 	 */
-	private async pickWorkspace(options?: {
-		title?: string;
-		initialValue?: string;
-		placeholder?: string;
-		filter?: (w: Workspace) => boolean;
-	}): Promise<Workspace | undefined> {
+	private async pickWorkspace(
+		source: WorkspacePickerSource,
+		options?: {
+			title?: string;
+			initialValue?: string;
+			placeholder?: string;
+			filter?: (w: Workspace) => boolean;
+		},
+	): Promise<WorkspacePickerResult> {
 		const quickPick = vscode.window.createQuickPick();
 		quickPick.value = options?.initialValue ?? "owner:me ";
 		quickPick.placeholder = options?.placeholder ?? "owner:me template:go";
 		quickPick.title = options?.title ?? "Connect to a workspace";
 		const filter = options?.filter;
 
-		let lastWorkspaces: readonly Workspace[];
+		let lastWorkspaces: readonly Workspace[] = [];
+		let settled = false;
+		let fetchErrorCategory: WorkspacePickerErrorCategory | undefined;
 		const disposables: vscode.Disposable[] = [];
 		disposables.push(
 			quickPick.onDidChangeValue((value) => {
@@ -924,6 +1526,7 @@ export class Commands {
 						q: value,
 					})
 					.then((workspaces) => {
+						fetchErrorCategory = undefined;
 						const filtered = filter
 							? workspaces.workspaces.filter(filter)
 							: workspaces.workspaces;
@@ -953,6 +1556,7 @@ export class Commands {
 						}
 					})
 					.catch((ex) => {
+						fetchErrorCategory = "fetch_error";
 						this.logger.error("Failed to fetch workspaces", ex);
 						if (ex instanceof CertificateError) {
 							void ex.showNotification();
@@ -969,26 +1573,52 @@ export class Commands {
 		);
 
 		quickPick.show();
-		return new Promise<Workspace | undefined>((resolve) => {
-			disposables.push(
-				quickPick.onDidHide(() => {
-					resolve(undefined);
-				}),
-				quickPick.onDidChangeSelection((selected) => {
-					if (selected.length < 1) {
-						return resolve(undefined);
-					}
-					const workspace =
-						lastWorkspaces[quickPick.items.indexOf(selected[0])];
-					resolve(workspace);
-				}),
-			);
-		}).finally(() => {
-			for (const d of disposables) {
-				d.dispose();
-			}
-			quickPick.dispose();
-		});
+		return this.workspaceOpenTelemetry
+			.tracePicker(
+				source,
+				async (telemetry) =>
+					new Promise<WorkspacePickerResult>((resolve) => {
+						const finish = (result: WorkspacePickerResult) => {
+							if (settled) {
+								return;
+							}
+							settled = true;
+							telemetry.finish(result, lastWorkspaces.length);
+							resolve(result);
+						};
+						disposables.push(
+							quickPick.onDidHide(() => {
+								if (fetchErrorCategory) {
+									finish({
+										status: "failed",
+										category: fetchErrorCategory,
+									});
+									return;
+								}
+								finish({ status: "cancelled" });
+							}),
+							quickPick.onDidChangeSelection((selected) => {
+								if (selected.length < 1) {
+									finish({ status: "cancelled" });
+									return;
+								}
+								const workspace =
+									lastWorkspaces[quickPick.items.indexOf(selected[0])];
+								if (!workspace) {
+									finish({ status: "cancelled" });
+									return;
+								}
+								finish({ status: "selected", workspace });
+							}),
+						);
+					}),
+			)
+			.finally(() => {
+				for (const d of disposables) {
+					d.dispose();
+				}
+				quickPick.dispose();
+			});
 	}
 
 	/**
@@ -1024,7 +1654,7 @@ export class Commands {
 	 * If provided, folderPath is always used, otherwise expanded_directory from
 	 * the agent is used.
 	 */
-	async openWorkspace(
+	private async openWorkspace(
 		baseUrl: string,
 		workspace: Workspace,
 		agent: WorkspaceAgent,
@@ -1032,13 +1662,13 @@ export class Commands {
 			OpenOptions,
 			"folderPath" | "openRecent" | "useDefaultDirectory"
 		> = {},
-	): Promise<boolean> {
+	): Promise<OpenWorkspaceResult> {
 		const { openRecent, useDefaultDirectory } = {
 			...openDefaults,
 			...options,
 		};
 		let { folderPath } = options;
-		const remoteAuthority = toRemoteAuthority(
+		let remoteAuthority = toRemoteAuthority(
 			baseUrl,
 			workspace.owner_name,
 			workspace.name,
@@ -1050,40 +1680,39 @@ export class Commands {
 		if (!vscode.workspace.workspaceFolders?.length) {
 			newWindow = false;
 		}
-
 		if (!folderPath && useDefaultDirectory) {
 			folderPath = agent.expanded_directory;
 		}
 
+		const { folders, entries } = await this.recentlyOpened();
 		// If the agent had no folder or we have been asked to open the most recent,
 		// we can try to open a recently opened folder/workspace.
 		if (!folderPath || openRecent) {
-			const output: {
-				workspaces: Array<{ folderUri: vscode.Uri; remoteAuthority: string }>;
-			} = await vscode.commands.executeCommand("_workbench.getRecentlyOpened");
-			const opened = output.workspaces.filter(
-				// Remove recents that do not belong to this connection.  The remote
-				// authority maps to a workspace/agent combination (using the SSH host
-				// name).  There may also be some legacy connections that still may
-				// reference a workspace without an agent name, which will be missed.
-				(opened) => opened.folderUri?.authority === remoteAuthority,
-			);
-
+			// One entry per folder: the same path can be in the list once per host.
+			const paths = [
+				...new Set(
+					folders
+						.filter((uri) =>
+							isRemoteAuthorityCompatible(uri.authority, remoteAuthority),
+						)
+						.map((uri) => uri.path),
+				),
+			];
 			// openRecent will always use the most recent.  Otherwise, if there are
 			// multiple we ask the user which to use.
-			if (opened.length === 1 || (opened.length > 1 && openRecent)) {
-				folderPath = opened[0].folderUri.path;
-			} else if (opened.length > 1) {
-				const items = opened.map((f) => f.folderUri.path);
-				folderPath = await vscode.window.showQuickPick(items, {
+			if (paths.length === 1 || (paths.length > 1 && openRecent)) {
+				folderPath = paths[0];
+			} else if (paths.length > 1) {
+				folderPath = await vscode.window.showQuickPick(paths, {
 					title: "Select a recently opened folder",
 				});
 				if (!folderPath) {
 					// User aborted.
-					return false;
+					return { status: "cancelled", stage: "recent_folder_picker" };
 				}
 			}
 		}
+		remoteAuthority = this.reusableAuthority(entries, remoteAuthority);
 
 		// Only set the memento when opening a new folder/window
 		await this.mementoManager.setStartupMode("start");
@@ -1101,6 +1730,13 @@ export class Commands {
 				this.logger.error(`IPC ping failed for ${remoteAuthority}`, err);
 			});
 
+		this.logger.info("Opening remote workspace", {
+			remoteAuthority,
+			workspace: `${workspace.owner_name}/${workspace.name}`,
+			agent: agent.name,
+			handoff: folderPath ? "folder" : "empty_window",
+		});
+
 		if (folderPath) {
 			await vscode.commands.executeCommand(
 				"vscode.openFolder",
@@ -1112,7 +1748,7 @@ export class Commands {
 				// Open this in a new window!
 				newWindow,
 			);
-			return true;
+			return { status: "opened", handoff: "folder" };
 		}
 
 		// This opens the workspace without an active folder opened.
@@ -1120,7 +1756,7 @@ export class Commands {
 			remoteAuthority: remoteAuthority,
 			reuseWindow: !newWindow,
 		});
-		return true;
+		return { status: "opened", handoff: "empty_window" };
 	}
 
 	// VS Code may dismiss a non-modal info message without resolving the
@@ -1154,6 +1790,19 @@ export class Commands {
 				);
 			});
 	}
+}
+
+function recordOpenResult(
+	telemetry: WorkspaceOpenTrace,
+	selection: { readonly workspace: Workspace; readonly agent: WorkspaceAgent },
+	result: OpenWorkspaceResult,
+): boolean {
+	if (result.status === "cancelled") {
+		telemetry.abort(result.stage, selection);
+		return false;
+	}
+	telemetry.handoff(result.handoff);
+	return true;
 }
 
 async function openFile(filePath: string): Promise<void> {

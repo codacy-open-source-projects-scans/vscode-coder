@@ -1,10 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import * as vscode from "vscode";
 
+import { InvalidApiResponseError } from "@/api/responseValidation";
 import { getHeaders } from "@/headers";
 import { OAuthAuthorizer } from "@/oauth/authorizer";
+import {
+	DEFAULT_OAUTH_SCOPES,
+	IF_SUPPORTED_OAUTH_SCOPES,
+} from "@/oauth/constants";
 
 import {
+	createMockUser,
 	MockCancellationToken,
 	MockProgress,
 	setupAxiosMockRoutes,
@@ -21,6 +27,8 @@ import {
 } from "./testUtils";
 
 import type { CreateAxiosDefaults } from "axios";
+
+import type { Deployment } from "@/deployment/types";
 
 vi.mock("axios", async () => {
 	const actual = await vi.importActual<typeof import("axios")>("axios");
@@ -42,9 +50,9 @@ vi.mock("@/headers", () => ({
 	getHeaderCommand: vi.fn(),
 }));
 
-vi.mock("@/api/utils", async () => {
+vi.mock("@/api/httpAgent", async () => {
 	const actual =
-		await vi.importActual<typeof import("@/api/utils")>("@/api/utils");
+		await vi.importActual<typeof import("@/api/httpAgent")>("@/api/httpAgent");
 	return { ...actual, createHttpAgent: vi.fn() };
 });
 
@@ -70,11 +78,12 @@ function createTestContext() {
 	const startLogin = async (options?: {
 		progress?: MockProgress;
 		token?: MockCancellationToken;
+		deployment?: Deployment;
 	}) => {
 		const progress = options?.progress ?? new MockProgress();
 		const token = options?.token ?? new MockCancellationToken();
 		const loginPromise = authorizer.login(
-			createTestDeployment(),
+			options?.deployment ?? createTestDeployment(),
 			progress,
 			token,
 		);
@@ -112,19 +121,17 @@ async function waitForBrowserToOpen(): Promise<{
 describe("OAuthAuthorizer", () => {
 	describe("login flow", () => {
 		it("completes full OAuth login flow successfully", async () => {
-			const { mockAdapter, oauthCallback, secretsManager, authorizer } =
+			const { setupOAuthRoutes, oauthCallback, secretsManager, authorizer } =
 				createTestContext();
 
-			setupAxiosMockRoutes(mockAdapter, {
-				"/.well-known/oauth-authorization-server":
-					createMockOAuthMetadata(TEST_URL),
+			setupOAuthRoutes(undefined, {
 				"/oauth2/register": createMockClientRegistration({
 					client_id: "registered-client-id",
 				}),
 				"/oauth2/token": createMockTokenResponse({
 					access_token: "oauth-access-token",
 				}),
-				"/api/v2/users/me": { username: "oauth-user" },
+				"/api/v2/users/me": createMockUser({ username: "oauth-user" }),
 			});
 
 			const deployment = createTestDeployment();
@@ -158,7 +165,7 @@ describe("OAuthAuthorizer", () => {
 		});
 
 		it("uses existing client registration when redirect URI matches", async () => {
-			const { mockAdapter, oauthCallback, secretsManager, authorizer } =
+			const { setupOAuthRoutes, oauthCallback, secretsManager, authorizer } =
 				createTestContext();
 
 			// Pre-store a client registration with matching redirect URI
@@ -171,12 +178,8 @@ describe("OAuthAuthorizer", () => {
 			);
 
 			// Registration endpoint should throw if called (existing registration should be reused)
-			setupAxiosMockRoutes(mockAdapter, {
+			setupOAuthRoutes(undefined, {
 				"/oauth2/register": new Error("Should not re-register"),
-				"/.well-known/oauth-authorization-server":
-					createMockOAuthMetadata(TEST_URL),
-				"/oauth2/token": createMockTokenResponse(),
-				"/api/v2/users/me": { username: "test-user" },
 			});
 
 			const loginPromise = authorizer.login(
@@ -197,7 +200,7 @@ describe("OAuthAuthorizer", () => {
 		});
 
 		it("re-registers client when redirect URI has changed", async () => {
-			const { mockAdapter, oauthCallback, secretsManager, authorizer } =
+			const { setupOAuthRoutes, oauthCallback, secretsManager, authorizer } =
 				createTestContext();
 
 			// Pre-store a client registration with different redirect URI
@@ -210,14 +213,10 @@ describe("OAuthAuthorizer", () => {
 			);
 
 			// Server will return new registration
-			setupAxiosMockRoutes(mockAdapter, {
-				"/.well-known/oauth-authorization-server":
-					createMockOAuthMetadata(TEST_URL),
+			setupOAuthRoutes(undefined, {
 				"/oauth2/register": createMockClientRegistration({
 					client_id: "new-client-id",
 				}),
-				"/oauth2/token": createMockTokenResponse(),
-				"/api/v2/users/me": { username: "test-user" },
 			});
 
 			const loginPromise = authorizer.login(
@@ -259,6 +258,144 @@ describe("OAuthAuthorizer", () => {
 				"exchanging token...",
 				"fetching user...",
 			]);
+		});
+
+		it("rewrites the endpoint origin when alternativeWebUrl is set", async () => {
+			const {
+				configurationProvider,
+				setupOAuthRoutes,
+				startLogin,
+				completeLogin,
+			} = createTestContext();
+			configurationProvider.set(
+				"coder.alternativeWebUrl",
+				"https://coder.example.com",
+			);
+			setupOAuthRoutes(
+				createMockOAuthMetadata("https://coder.example.com:7004"),
+			);
+
+			const { loginPromise, authUrl, state } = await startLogin({
+				deployment: {
+					url: "https://coder.example.com:7004",
+					safeHostname: "coder.example.com",
+				},
+			});
+			expect(authUrl.origin).toBe("https://coder.example.com");
+			expect(authUrl.pathname).toBe("/oauth2/authorize");
+
+			await completeLogin(state);
+			await loginPromise;
+		});
+
+		it("preserves a path prefix on alternativeWebUrl", async () => {
+			const {
+				configurationProvider,
+				setupOAuthRoutes,
+				startLogin,
+				completeLogin,
+			} = createTestContext();
+			configurationProvider.set(
+				"coder.alternativeWebUrl",
+				"https://proxy.example.com/coder",
+			);
+			setupOAuthRoutes(
+				createMockOAuthMetadata("https://coder.example.com:7004"),
+			);
+
+			const { loginPromise, authUrl, state } = await startLogin({
+				deployment: {
+					url: "https://coder.example.com:7004",
+					safeHostname: "coder.example.com",
+				},
+			});
+			expect(authUrl.origin).toBe("https://proxy.example.com");
+			expect(authUrl.pathname).toBe("/coder/oauth2/authorize");
+
+			await completeLogin(state);
+			await loginPromise;
+		});
+
+		it("does not double the path prefix on sub-path deployments", async () => {
+			const { setupOAuthRoutes, startLogin, completeLogin } =
+				createTestContext();
+			setupOAuthRoutes(createMockOAuthMetadata("https://example.com/coder"));
+
+			const { loginPromise, authUrl, state } = await startLogin({
+				deployment: {
+					url: "https://example.com/coder",
+					safeHostname: "example.com",
+				},
+			});
+			expect(authUrl.origin).toBe("https://example.com");
+			expect(authUrl.pathname).toBe("/coder/oauth2/authorize");
+
+			await completeLogin(state);
+			await loginPromise;
+		});
+
+		it("swaps the sub-path prefix for the alternativeWebUrl prefix", async () => {
+			const {
+				configurationProvider,
+				setupOAuthRoutes,
+				startLogin,
+				completeLogin,
+			} = createTestContext();
+			configurationProvider.set(
+				"coder.alternativeWebUrl",
+				"https://proxy.example.com/proxy",
+			);
+			setupOAuthRoutes(createMockOAuthMetadata("https://example.com/coder"));
+
+			const { loginPromise, authUrl, state } = await startLogin({
+				deployment: {
+					url: "https://example.com/coder",
+					safeHostname: "example.com",
+				},
+			});
+			expect(authUrl.origin).toBe("https://proxy.example.com");
+			expect(authUrl.pathname).toBe("/proxy/oauth2/authorize");
+
+			await completeLogin(state);
+			await loginPromise;
+		});
+
+		it("preserves query params already on the authorization endpoint", async () => {
+			const { setupOAuthRoutes, startLogin, completeLogin } =
+				createTestContext();
+			setupOAuthRoutes(
+				createMockOAuthMetadata(TEST_URL, {
+					authorization_endpoint: `${TEST_URL}/oauth2/authorize?audience=workspace`,
+				}),
+			);
+
+			const { loginPromise, authUrl, state } = await startLogin();
+			expect(authUrl.searchParams.get("audience")).toBe("workspace");
+			expect(authUrl.searchParams.get("client_id")).toBeTruthy();
+
+			await completeLogin(state);
+			await loginPromise;
+		});
+
+		it.each([
+			{ name: "the server supports", supported: IF_SUPPORTED_OAUTH_SCOPES },
+			{ name: "none when the server supports none", supported: [] },
+		])("requests IF_SUPPORTED_OAUTH_SCOPES: $name", async ({ supported }) => {
+			const { setupOAuthRoutes, startLogin, completeLogin } =
+				createTestContext();
+			setupOAuthRoutes(
+				createMockOAuthMetadata(TEST_URL, {
+					scopes_supported: [...DEFAULT_OAUTH_SCOPES.split(" "), ...supported],
+				}),
+			);
+
+			const { loginPromise, authUrl, state } = await startLogin();
+			expect(authUrl.searchParams.get("scope")).toBe(
+				[DEFAULT_OAUTH_SCOPES, ...supported].join(" "),
+			);
+
+			await completeLogin(state);
+			await loginPromise;
 		});
 	});
 
@@ -386,6 +523,35 @@ describe("OAuthAuthorizer", () => {
 					new MockCancellationToken(),
 				),
 			).rejects.toThrow("Server does not support dynamic client registration");
+		});
+
+		it("rejects a token response without an access token", async () => {
+			const { setupOAuthRoutes, startLogin, completeLogin } =
+				createTestContext();
+			setupOAuthRoutes(undefined, {
+				"/oauth2/token": { token_type: "Bearer" },
+			});
+
+			const { loginPromise, state } = await startLogin();
+			await completeLogin(state);
+
+			await expect(loginPromise).rejects.toThrow(InvalidApiResponseError);
+		});
+
+		it("rejects a registration response without a client_id", async () => {
+			const { setupOAuthRoutes, authorizer } = createTestContext();
+			setupOAuthRoutes(undefined, {
+				"/oauth2/register": { client_secret: "no-id" },
+			});
+
+			// Fails before the browser opens, so there is no callback to complete.
+			await expect(
+				authorizer.login(
+					createTestDeployment(),
+					new MockProgress(),
+					new MockCancellationToken(),
+				),
+			).rejects.toThrow(InvalidApiResponseError);
 		});
 	});
 });

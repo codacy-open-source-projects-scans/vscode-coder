@@ -1,0 +1,18 @@
+/* Shared control geometry: fixed heights and flex centering, never
+   line-height or vertical padding math, which drift with font metrics.
+   Focus rings use :focus, not :focus-visible, like VS Code's button:focus. */
+.ui-control {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box;
+	font: inherit;
+	line-height: 1;
+	white-space: nowrap;
+	user-select: none;
+}
+
+.ui-control:disabled {
+	opacity: var(--ui-disabled-opacity);
+	cursor: default;
+}
