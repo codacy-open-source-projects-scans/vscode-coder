@@ -5,7 +5,30 @@
      from published versions since it shows up in the VS Code extension changelog
      tab and is confusing to users. Add it back between releases if needed. -->
 
-## Unreleased
+## [v1.17.1](https://github.com/coder/vscode-coder/releases/tag/v1.17.1) 2026-10-15
+
+### Changed
+
+- Rename `coder.experimental.oauth` to `coder.oauth.enabled` now that OAuth is
+  generally available. Existing values remain effective until the new setting is
+  explicitly set in user settings. OAuth remains disabled by default.
+
+### Fixed
+
+- Fix "Premature close" since v1.17.0 in Positron, VSCodium and other editors
+  that use the open source "Open Remote - SSH" extension (`open-remote-ssh`):
+  the SSH `ProxyCommand` single-quoted `--url` and `--global-config`, and these
+  editors passed the quotes to the CLI literally. `--token=` also merged with
+  the next argument.
+- `coder.headerCommand` now works with `open-remote-ssh` unless it contains `$`,
+  a backtick, `\`, `%` or a line break.
+- On Windows, a `coder.headerCommand` containing `"` was split into several
+  arguments before it reached the CLI.
+- On Windows, `open-remote-ssh` 0.4.0 dropped every `\` from the paths in the
+  SSH `ProxyCommand`, so connections failed. Drive-letter paths are now written
+  with `/`.
+
+## [v1.17.0](https://github.com/coder/vscode-coder/releases/tag/v1.17.0) 2026-10-13
 
 ### Added
 
@@ -18,11 +41,61 @@
   the socket never reaches a terminal failure. The extension keeps retrying until
   the server is reachable again.
 
+### Changed
+
+- Report the editor you connect from, such as Cursor or Windsurf, to Coder
+  for workspace session tracking. Requires Coder 2.38.0 or later; older
+  versions keep reporting `vscode`.
+
 ### Fixed
 
-- OAuth sign-in now works on deployments that enforce token scopes. Users signed
-  in with OAuth are asked to sign in again once.
-- Revoke OAuth tokens on logout even when their scopes are outdated.
+- OAuth sign-in is offered only when the deployment enables Coder's OAuth2
+  provider and allows dynamic client registration, which is off by default
+  from Coder 2.37; otherwise a notice says sign-in uses a session token. OAuth
+  becomes the default sign-in method in a future release, so ask your Coder
+  administrator to enable them. For instructions, see
+  [OAuth2 provider](https://coder.com/docs/admin/integrations/oauth2-provider).
+- OAuth sign-in now works on deployments that enforce token scopes, and
+  requests the permissions needed to refresh workspace external-auth links.
+  Sessions missing required scopes stop refreshing and require sign-in when
+  they expire.
+- Preserve OAuth refresh credentials when reusing a stored token.
+- Revoke OAuth tokens on logout and after successful session replacement, even
+  when their scopes are outdated. Failed or canceled sign-ins do not revoke
+  the stored session.
+- Keep session tokens, OAuth tokens, and client secrets out of the Coder output
+  channel and its buffered logs, including from failed requests.
+- CLI commands and SSH connections that the extension starts ignore
+  `CODER_SESSION_TOKEN` from the environment and use your stored session, so
+  they no longer fail or run as a different user when that variable is set.
+- Run workspace app commands as arguments to `coder ssh` instead of typing them
+  into a local terminal. This requires Coder CLI v2.23.0 or later.
+- Validate workspace, owner, and agent names from the deployment before using
+  them in SSH hosts and paths, preserving legacy agents with underscores and
+  leading or trailing hyphens.
+- Reject deployment hostnames unsafe for directory names, with Windows-specific
+  restrictions applied only on Windows.
+- Show validation failures without rendering deployment-provided values in
+  notifications; diagnostic details are available in Coder Output.
+- Show the network tooltip's relay name as plain text instead of rendering
+  deployment-provided markdown.
+- Reject deployment URLs that contain shell metacharacters or `%` when building
+  SSH commands. If an earlier version stored such a URL, or a URL with a
+  non-ASCII hostname, you are asked to sign in again, and the URL is then
+  stored in its ASCII form.
+- Reject deployment URLs that include a username, password, query, or fragment
+  when you sign in. If a proxy in front of your deployment needs credentials,
+  send them with `coder.headerCommand`.
+- Keep the stored URL of a deployment you are signed in to when a link names
+  the same origin with a different path.
+- Apply the SSH connection settings in Devin Desktop (formerly Windsurf), which
+  reads them from `remote.devinSSH.*`, or `remote.windsurfSSH.*` on Windsurf
+  2.0 to 2.3, instead of `remote.SSH.*`. Each editor now gets only the
+  settings its Remote SSH extension reads, both on connect and in **Coder:
+  Apply Recommended SSH Settings**.
+- Escape glob characters in the SSH config `Include` path in a way OpenSSH for
+  Windows understands, so a config directory whose path contains `*`, `?`, or
+  `[` is included correctly on Windows.
 
 ## [v1.16.4](https://github.com/coder/vscode-coder/releases/tag/v1.16.4) 2026-09-23
 

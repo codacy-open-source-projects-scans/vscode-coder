@@ -3,13 +3,14 @@ import { stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import * as vscode from "vscode";
 
-import { escapeCommandArg } from "../common/strings";
+import { validateIdentifier } from "../common/validation";
 import { isAbortError } from "../error/abort";
 import { toError } from "../error/normalize";
+import { type CliFeatureSet } from "../featureSet";
 import {
 	type CliAuth,
+	getCliProcessEnv,
 	getGlobalFlags,
-	getGlobalShellFlags,
 } from "../settings/cli";
 
 /** Resolved CLI environment for invoking the coder binary. */
@@ -83,12 +84,16 @@ export async function speedtest(
 	signal?: AbortSignal,
 ): Promise<string> {
 	const globalFlags = getGlobalFlags(env.configs, env.auth);
-	const args = [...globalFlags, "speedtest", workspaceName, "--output", "json"];
+	const args = [...globalFlags, "speedtest", "--output", "json"];
 	if (duration) {
 		args.push("-t", duration);
 	}
+	args.push("--", workspaceName);
 	try {
-		const result = await execFileAsync(env.binary, args, { signal });
+		const result = await execFileAsync(env.binary, args, {
+			env: getCliProcessEnv(),
+			signal,
+		});
 		return result.stdout;
 	} catch (error) {
 		throw cliError(error);
@@ -107,7 +112,7 @@ export async function netcheck(
 		const result = await execFileAsync(
 			env.binary,
 			[...globalFlags, "netcheck"],
-			{ signal },
+			{ env: getCliProcessEnv(), signal },
 		);
 		return result.stdout;
 	} catch (error) {
@@ -134,15 +139,16 @@ export async function supportBundle(
 		...globalFlags,
 		"support",
 		"bundle",
-		workspaceName,
-		...(agentName ? [agentName] : []),
 		"--output-file",
 		outputPath,
 		"--yes",
 		...workspaceFiles.flatMap((file) => ["--workspace-file", file]),
+		"--",
+		workspaceName,
+		...(agentName ? [agentName] : []),
 	];
 	try {
-		await execFileAsync(env.binary, args, { signal });
+		await execFileAsync(env.binary, args, { env: getCliProcessEnv(), signal });
 	} catch (error) {
 		throw cliError(error);
 	}
@@ -156,30 +162,44 @@ export function ping(env: CliEnv, workspaceName: string): vscode.Terminal {
 	return spawnCliInTerminal({
 		name: `Coder Ping: ${workspaceName}`,
 		binary: env.binary,
-		args: [...globalFlags, "ping", workspaceName],
+		args: [...globalFlags, "ping", "--", workspaceName],
 		banner: ["Press Ctrl+C (^C) to stop.", "─".repeat(40)],
 	});
 }
 
 /**
- * SSH into a workspace and run a command via `terminal.sendText`.
+ * Open a terminal that runs `coder ssh <workspace> -- <command>` with no
+ * local shell in between. Older CLIs cannot take a command, and falling back
+ * to typing it into a local shell would let the deployment run local code.
  */
-export async function openAppStatusTerminal(
-	env: CliEnv,
-	app: {
-		name?: string;
-		command?: string;
-		workspace_name: string;
-	},
-): Promise<void> {
-	const globalFlags = getGlobalShellFlags(env.configs, env.auth);
-	const terminal = vscode.window.createTerminal({ name: app.name });
-	terminal.sendText(
-		`${escapeCommandArg(env.binary)} ${globalFlags.join(" ")} ssh ${escapeCommandArg(app.workspace_name)}`,
+export function openAppStatusTerminal(
+	env: CliEnv & { featureSet: CliFeatureSet },
+	app: { name?: string; command: string; workspace_name: string },
+): void {
+	if (!env.featureSet.sshCommand) {
+		throw new Error("Running app commands requires Coder CLI v2.23.0 or later");
+	}
+	const workspaceName = validateIdentifier(
+		app.workspace_name,
+		"workspace name",
 	);
-	await new Promise((resolve) => setTimeout(resolve, 5000));
-	terminal.sendText(app.command ?? "");
-	terminal.show(false);
+	const args = [
+		...getGlobalFlags(env.configs, env.auth),
+		"ssh",
+		...(env.featureSet.sshTty ? ["--tty"] : []),
+		workspaceName,
+		"--",
+		app.command,
+	];
+	vscode.window
+		.createTerminal({
+			name: app.name,
+			shellPath: env.binary,
+			shellArgs: args,
+			env: getCliProcessEnv(),
+			strictEnv: true,
+		})
+		.show(false);
 }
 
 const execFileAsync = promisify(execFile);
@@ -221,6 +241,7 @@ function spawnCliInTerminal(options: {
 	// fall back to proc.kill() there.
 	const useProcessGroup = process.platform !== "win32";
 	const proc = spawn(options.binary, options.args, {
+		env: getCliProcessEnv(),
 		detached: useProcessGroup,
 	});
 

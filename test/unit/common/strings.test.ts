@@ -1,7 +1,12 @@
 import os from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { escapeCommandArg, escapeShellArg } from "@/common/strings";
+import {
+	escapeCommandArg,
+	escapeProxyCommandArg,
+	escapeProxyCommandPath,
+	escapeShellArg,
+} from "@/common/strings";
 
 describe("escapeCommandArg", () => {
 	it("returns simple strings unquoted", () => {
@@ -16,6 +21,13 @@ describe("escapeCommandArg", () => {
 	it("quotes the empty string so it survives as a token", () => {
 		expect(escapeCommandArg("")).toBe('""');
 	});
+
+	it.each([["--token="], ["=x"], ["x==y"]])(
+		"quotes a leading, trailing or doubled `=`: %j",
+		(input) => {
+			expect(escapeCommandArg(input)).toBe(`"${input}"`);
+		},
+	);
 
 	it("escapes double quotes and wraps in quotes", () => {
 		expect(escapeCommandArg('say "hello"')).toBe(String.raw`"say \"hello\""`);
@@ -85,20 +97,49 @@ describe("escapeShellArg", () => {
 			expect(escapeShellArg("env=dev")).toBe('"env=dev"');
 		});
 
-		it('doubles embedded `"`', () => {
-			expect(escapeShellArg('regions=["us","eu"]')).toBe(
-				'"regions=[""us"",""eu""]"',
-			);
+		it.each([
+			['regions=["us","eu"]', String.raw`"regions=[\"us\",\"eu\"]"`],
+			['C:\\a b\\ \\"x\\', '"C:\\a b\\ \\\\\\"x\\\\"'],
+		])('escapes `"` and the backslashes before it in %j', (value, expected) => {
+			expect(escapeShellArg(value)).toBe(expected);
 		});
 
-		it("doubles `%` to block %VAR% expansion", () => {
+		it("doubles `%` so OpenSSH token expansion keeps it literal", () => {
 			expect(escapeShellArg("%PATH%")).toBe('"%%PATH%%"');
 		});
+	});
+});
 
-		it("keeps cmd metachars inside the quoted region", () => {
-			expect(escapeShellArg('foo" & calc.exe & "x')).toBe(
-				'"foo"" & calc.exe & ""x"',
-			);
-		});
+describe("escapeProxyCommandArg", () => {
+	it.each([
+		["--token=", escapeCommandArg],
+		['say "hi"', escapeCommandArg],
+		["get-headers --profile 'prod' | jq", escapeCommandArg],
+		["$TOKEN", escapeShellArg],
+		["`whoami`", escapeShellArg],
+		[String.raw`a\b`, escapeShellArg],
+		["%h", escapeShellArg],
+		["line\nbreak", escapeShellArg],
+	])("quotes %j", (value, escape) => {
+		expect(escapeProxyCommandArg(value)).toBe(escape(value));
+	});
+});
+
+describe("escapeProxyCommandPath", () => {
+	const platformSpy = vi.spyOn(os, "platform");
+	afterEach(() => platformSpy.mockReset());
+
+	it.each([
+		[
+			"win32",
+			String.raw`C:\Users\John Doe\coder.exe`,
+			'"C:/Users/John Doe/coder.exe"',
+		],
+		["win32", String.raw`d:\a\b`, "d:/a/b"],
+		["win32", String.raw`\\server\share\x`, String.raw`"\\server\share\x"`],
+		["linux", String.raw`C:\x`, String.raw`'C:\x'`],
+	] as const)("on %s writes %j as %s", (platform, value, expected) => {
+		platformSpy.mockReturnValue(platform);
+		expect(escapeProxyCommandPath(value)).toBe(expected);
 	});
 });

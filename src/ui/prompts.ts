@@ -2,10 +2,16 @@ import { type WorkspaceAgent } from "coder/site/src/api/typesGenerated";
 import * as vscode from "vscode";
 
 import { type CoderApi } from "../api/coderApi";
+import {
+	parseDeploymentUrl,
+	validateDeploymentUrl,
+} from "../common/validation";
 import { OAuthMetadataClient } from "../oauth/metadataClient";
 import { type MementoManager } from "../storage/mementoManager";
 
 import { withProgress } from "./progress";
+
+import type { Logger } from "../logging/logger";
 
 type AuthMethod = "oauth" | "legacy";
 
@@ -131,37 +137,46 @@ export async function maybeAskUrl(
 		// Default to HTTPS if not provided so URLs can be typed more easily.
 		url = "https://" + url;
 	}
+	// Converts an international domain name to its ASCII (punycode) form.
+	url = parseDeploymentUrl(url).href;
 	while (url.endsWith("/")) {
 		url = url.substring(0, url.length - 1);
 	}
-	return url;
+	// Fail before sign-in rather than when the URL reaches the SSH ProxyCommand.
+	return validateDeploymentUrl(url);
 }
 
 export async function maybeAskAuthMethod(
 	client: CoderApi,
+	logger: Logger,
 ): Promise<AuthMethod | undefined> {
-	const experimentalOAuthEnabled = vscode.workspace
-		.getConfiguration()
-		.get<boolean>("coder.experimental.oauth", false);
+	const config = vscode.workspace.getConfiguration();
+	const oauthEnabled =
+		config.inspect<boolean>("coder.oauth.enabled")?.globalValue ??
+		config.get<boolean>("coder.experimental.oauth", false);
 
-	if (!experimentalOAuthEnabled) {
+	if (!oauthEnabled) {
 		return "legacy";
 	}
 
-	// Check if server supports OAuth with progress indication
-	const supportsOAuth = await withProgress(
+	const support = await withProgress(
 		{
 			location: vscode.ProgressLocation.Notification,
 			title: "Checking authentication methods",
 		},
-		() => OAuthMetadataClient.checkOAuthSupport(client.getAxiosInstance()),
+		() =>
+			OAuthMetadataClient.checkOAuthSupport(client.getAxiosInstance(), logger),
 	);
 
-	if (supportsOAuth) {
+	if (support === "supported") {
 		return await askAuthMethod();
-	} else {
-		return "legacy";
 	}
+	if (support === "registration_disabled") {
+		void vscode.window.showWarningMessage(
+			"OAuth sign-in is unavailable: dynamic client registration is disabled on this deployment. Signing in with a session token instead.",
+		);
+	}
+	return "legacy";
 }
 
 /**

@@ -2,7 +2,11 @@ import { spawn } from "node:child_process";
 import * as vscode from "vscode";
 
 import { errToStr } from "../error/normalize";
-import { getGlobalFlags, type CliAuth } from "../settings/cli";
+import {
+	getCliProcessEnv,
+	getGlobalFlags,
+	type CliAuth,
+} from "../settings/cli";
 
 import { createWorkspaceIdentifier } from "./models";
 
@@ -78,9 +82,10 @@ function runCliCommand(ctx: CliContext, args: string[]): Promise<void> {
 		const fullArgs = [
 			...getGlobalFlags(vscode.workspace.getConfiguration(), ctx.auth),
 			...args,
+			"--",
 			createWorkspaceIdentifier(ctx.workspace),
 		];
-		const proc = spawn(ctx.binPath, fullArgs);
+		const proc = spawn(ctx.binPath, fullArgs, { env: getCliProcessEnv() });
 		// Unexpected prompts EOF instead of hanging forever.
 		proc.stdin.end();
 
